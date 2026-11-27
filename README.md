@@ -127,12 +127,17 @@ From that, with nothing typed by hand in any workbook:
 - `InstallTool` and every update add any version missing from the **Revision
   History** table on the README sheet
 
-The table only ever grows. Every line already in it stays exactly as typed,
-including any added by hand; versions from `ToolHistory` that are not in it
+The table only ever grows. Every line already in it stays, and any added by
+hand stays exactly as typed; versions from `ToolHistory` that are not in it
 yet are added; and the lines are put in version order, oldest at the top
 (`1.10` after `1.9`). When a formatted Excel table is full it gets another row;
 in plain cells, only the table's own columns are pushed down. A table that
 already lists every version is not touched at all.
+
+The tool's own versions take their date and description from `ToolHistory`,
+so a correction to one of those lines is made there and reaches every
+workbook on its next update. Dates are written as text, day first
+(`27/11/2026`), the way the template's table holds them.
 
 It is found by its heading, `Revision History:` (`Version history` is
 recognised too, colon or not), with its header row directly under it, and its
