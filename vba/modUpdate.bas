@@ -160,7 +160,15 @@ Private Function SourceSetting() As String
 
     For r = 1 To 40
         If StrComp(Trim$(CStr(ws.Cells(r, 1).Value)), LBL_SOURCE, vbTextCompare) = 0 Then
-            SourceSetting = Trim$(CStr(ws.Cells(r, 2).Value))
+            ' A web address pasted into a cell often becomes a link that shows
+            ' the page's title ("owner/repo: description") instead of the
+            ' address. The address is still behind it, so that is used.
+            On Error Resume Next
+            If ws.Cells(r, 2).Hyperlinks.Count > 0 Then
+                SourceSetting = Trim$(ws.Cells(r, 2).Hyperlinks(1).Address)
+            End If
+            On Error GoTo 0
+            If Len(SourceSetting) = 0 Then SourceSetting = Trim$(CStr(ws.Cells(r, 2).Value))
             Exit Function
         End If
     Next r
@@ -179,6 +187,19 @@ Private Function SourceBase(ByVal src As String) As String
         src = Left$(src, Len(src) - 1)
     Loop
 
+    ' Shorter ways of writing the same GitHub address, all accepted:
+    '   github.com/owner/repo, http://, www.
+    '   owner/repo, which is also how GitHub titles the page, with
+    '   ": description" after it if the title was pasted
+    If LCase$(Left$(src, 7)) = "http://" Then src = "https://" & Mid$(src, 8)
+    If LCase$(Left$(src, 12)) = "https://www." Then src = "https://" & Mid$(src, 13)
+    If LCase$(Left$(src, 4)) = "www." Then src = Mid$(src, 5)
+    If LCase$(Left$(src, 11)) = "github.com/" Then src = "https://" & src
+    If LooksLikeOwnerRepo(src) Then
+        If InStr(src, ":") > 0 Then src = Trim$(Left$(src, InStr(src, ":") - 1))
+        src = "https://github.com/" & src
+    End If
+
     If LCase$(Left$(src, 19)) = "https://github.com/" Then
         rest = Mid$(src, 20)
         parts = Split(rest, "/")
@@ -195,6 +216,16 @@ Private Function SourceBase(ByVal src As String) As String
     End If
 
     SourceBase = src
+End Function
+
+
+' "owner/repo", optionally followed by ": description". Never a folder: a
+' folder path has a drive letter or starts with backslashes.
+Private Function LooksLikeOwnerRepo(ByVal src As String) As Boolean
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Pattern = "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+(\s*:.*)?$"
+    LooksLikeOwnerRepo = re.Test(src)
 End Function
 
 
@@ -229,6 +260,12 @@ Private Function Fetch(ByVal base As String, ByVal moduleName As String, _
         End If
         txt = http.responseText
     Else
+        If Not IsFolder(base) Then
+            why = "'" & base & "' is not a web address, and not a folder this PC can " & _
+                  "open. For GitHub, type the address in full, e.g. " & _
+                  "https://github.com/owner/repo"
+            Exit Function
+        End If
         p = base & Application.PathSeparator & "vba" & Application.PathSeparator & moduleName & ".bas"
         If Len(Dir$(p)) = 0 Then p = base & Application.PathSeparator & moduleName & ".bas"
         If Len(Dir$(p)) = 0 Then
@@ -446,6 +483,17 @@ Private Function WriteTemp(ByVal moduleName As String, ByVal code As String) As 
 Failed:
     On Error Resume Next
     Close #f
+End Function
+
+
+' True for a folder that exists. Anything Windows cannot even parse as a
+' path, such as a page title, is simply not one: that is the Error 52 a
+' pasted title used to give.
+Private Function IsFolder(ByVal path As String) As Boolean
+    On Error Resume Next
+    IsFolder = ((GetAttr(path) And vbDirectory) = vbDirectory)
+    If Err.Number <> 0 Then IsFolder = False
+    On Error GoTo 0
 End Function
 
 
