@@ -1,0 +1,3253 @@
+Attribute VB_Name = "modSchedule"
+Option Explicit
+
+' ---------------------------------------------------------------------------
+' modSchedule - everything that reads from, or writes to, one schedule
+' workbook. Nothing in here is a button; modMain drives it.
+'
+' The contract this enforces in every schedule:
+'
+'   Metadata!B4:B6  are the ONLY cells that link to MAINPROJECTINFO.
+'   Everything else on Front Cover / Revision Page reads the local Metadata
+'   or the local Revision Page. So a schedule copied away from the project
+'   folder keeps working; only Project Name / Number / Client go stale.
+' ---------------------------------------------------------------------------
+
+' Rows written on the Metadata sheet. Order matters, labels are the API that
+' the ScheduleList reads back, so do not rename them casually.
+Private Const META_LAST_ROW As Long = 14
+
+' Windows refuses a path longer than this, and a half-written PDF is worse
+' than a refusal, so a name that would go over is reported instead.
+Private Const MAX_PDF_PATH As Long = 255
+
+' Revision Page cells that are typed per document and must not be inherited
+' when the common sheets are copied from a reference schedule.
+Private Const KEEP_LABELS As String = _
+    "Document type,Delref Classification,BSUID,Trigger Events"
+
+' Security markings looked for in headers, footers and cells, as a regular
+' expression. Most specific first, so OFFICIAL-SENSITIVE is never read as
+' OFFICIAL and TOP SECRET never as SECRET.
+Private Const MARKINGS As String = _
+    "OFFICIAL[- ]SENSITIVE|COMMERCIAL IN CONFIDENCE|TOP SECRET|SECRET|CONFIDENTIAL|RESTRICTED|OFFICIAL"
+
+' The title block the tool draws at the top of a schedule sheet. Matches the
+' project template: four rows in three groups of merged cells, Verdana 7 with
+' thin borders, a gap, then the General Notes box merged across the full
+' width. All of it sits in the print titles so it repeats on every page.
+Private Const TB_ROWS       As Long = 4       ' the block is rows 1 to 4
+Private Const TB_NOTES_TOP  As Long = 6       ' a notes box the tool adds starts here
+Private Const TB_NOTES_ROWS As Long = 6       ' ...and is this many rows tall
+Private Const TB_INSERT     As Long = 12      ' rows added above a bare schedule
+Private Const TB_FONT       As String = "Verdana"
+Private Const TB_SIZE       As Double = 7
+Private Const TB_TITLE_H    As Double = 20.1  ' row 1
+Private Const TB_ROW_H      As Double = 9.9   ' rows 2 to 4, and the added rows
+' Verdana 7 in capitals, in Excel column-width units per character. Only used
+' to decide where the three groups split and to warn when text will not fit.
+Private Const TB_CHAR_W     As Double = 0.85
+
+
+' A schedule's revision history, lifted out before its sheet is replaced.
+Private Type RevData
+    Valid As Boolean
+    Headers() As String
+    Cells() As Variant
+    RowCount As Long
+    ColCount As Long
+End Type
+
+
+' One sheet's header and footer, captured from the source workbook.
+Public Type HFSet
+    Valid As Boolean
+    LeftHeader As String
+    CenterHeader As String
+    RightHeader As String
+    LeftFooter As String
+    CenterFooter As String
+    RightFooter As String
+    DiffFirstPage As Boolean
+    OddAndEven As Boolean
+    AlignMargins As Boolean
+    ScaleWithDoc As Boolean
+    FirstLeftHeader As String
+    FirstCenterHeader As String
+    FirstRightHeader As String
+    FirstLeftFooter As String
+    FirstCenterFooter As String
+    FirstRightFooter As String
+    EvenLeftHeader As String
+    EvenCenterHeader As String
+    EvenRightHeader As String
+    EvenLeftFooter As String
+    EvenCenterFooter As String
+    EvenRightFooter As String
+End Type
+
+' Revision families in priority order, lowest first. "P" preliminary,
+' "C" construction, "AF" as fitted, so AF01 beats C09 beats P12.
+' Add a family here and re-run setup to push it into every schedule.
+Public Const REV_PREFIXES As String = "P,C,AF"
+
+
+' The suitability codes seeded onto the Setup sheet and pushed into every
+' schedule's Metadata sheet. ISO 19650 CDE status codes.
+'
+' Format is "<code> - <description>". The title block splits on the " - ",
+' so no description may contain one.
+'
+' S5 is deliberately absent: the standard leaves it to project guidance, so a
+' shared dropdown cannot say anything useful about it. Historic revision rows
+' that already say "S5 - ..." keep their text, as they should - the revision
+' table is a record of what was issued, not something to rewrite. Add a row to
+' column F of the Setup sheet if this project needs S5 back.
+Public Function DefaultSuitabilityCodes() As Variant
+    DefaultSuitabilityCodes = Array( _
+        "S0 - Work in Progress", _
+        "S1 - Suitable for Coordination", _
+        "S2 - Suitable for Information", _
+        "S3 - Suitable for Review and Comment", _
+        "S4 - Suitable for Stage Approval", _
+        "S6 - Suitable for PIM Authorisation", _
+        "S7 - Suitable for AIM Authorisation", _
+        "A1 - Authorised and Accepted", _
+        "A2 - Authorised and Accepted", _
+        "B1 - Published with Comments", _
+        "B2 - Published with Comments")
+End Function
+
+
+' Repairs / sets up one open schedule workbook. Returns a log string
+' (empty means "nothing worth reporting"). Never saves - the caller decides.
+Public Function RepairWorkbook(ByVal wbTgt As Workbook, _
+                               ByVal mpiFullPath As String, _
+                               ByVal setupSheetName As String, _
+                               ByVal projNameRef As String, _
+                               ByVal projNoRef As String, _
+                               ByVal clientRef As String, _
+                               ByVal statuses As Variant, _
+                               ByVal fields As Variant) As String
+
+    Dim wsFront As Worksheet, wsMeta As Worksheet, wsRev As Worksheet
+    Dim log As String
+    Dim mpiName As String
+    Dim mpiPrefix As String
+    Dim revTitle As Range, frontTitle As Range
+    Dim recipRef As String, dateRef As String
+    Dim r As Long
+
+    mpiName = BaseName(mpiFullPath)
+    mpiPrefix = "'[" & mpiName & "]" & setupSheetName & "'!"
+
+    Set wsRev = GetSheet(wbTgt, SH_REV)
+    If wsRev Is Nothing Then
+        RepairWorkbook = "SKIPPED - no '" & SH_REV & "' sheet."
+        Exit Function
+    End If
+
+    Set wsFront = GetSheet(wbTgt, SH_FRONT)
+    Set wsMeta = GetSheet(wbTgt, SH_META)
+
+    ' Point any pre-existing link to the MPI at THIS MPI before we touch
+    ' formulas, otherwise Excel may bind new formulas to the stale link.
+    log = log & RepointMpiLink(wbTgt, mpiFullPath)
+
+    If wsMeta Is Nothing Then
+        Set wsMeta = wbTgt.Worksheets.Add(After:=wbTgt.Worksheets(wbTgt.Worksheets.Count))
+        wsMeta.Name = SH_META
+        log = log & "Created Metadata sheet. "
+    End If
+
+    ' --- Metadata --------------------------------------------------------
+    log = log & WriteMetadata(wsMeta, wsRev, mpiPrefix, projNameRef, projNoRef, clientRef, fields)
+
+    ' Wire any Revision Page label that matches a project field.
+    log = log & LinkProjectFields(wsRev, wsMeta, fields)
+
+    ' --- Revision Page ---------------------------------------------------
+    Set revTitle = FindTitleCell(wsRev)
+    If revTitle Is Nothing Then
+        log = log & "No 'SCHEDULE OF...' title found on Revision Page. "
+    ElseIf revTitle.Row > 1 Then
+        ' The cell directly above the title is the project name.
+        PutFormula wsRev.Cells(revTitle.Row - 1, revTitle.Column), _
+                   "=" & SheetRef(wsMeta.Name) & "!B4"
+    End If
+
+    WriteIfLabelled wsRev, "Project Name", "=" & SheetRef(wsMeta.Name) & "!B4", log
+    WriteIfLabelled wsRev, "Project no.", "=" & SheetRef(wsMeta.Name) & "!B5", log
+    WriteIfLabelled wsRev, "Recipient", "=" & SheetRef(wsMeta.Name) & "!B6", log
+    WriteIfLabelled wsRev, "Document no", "=" & SheetRef(wsMeta.Name) & "!B2", log
+
+    ' --- Front Cover -----------------------------------------------------
+    If wsFront Is Nothing Then
+        log = log & "No 'Front Cover' sheet. "
+    Else
+        recipRef = AbsRefOfLabelValue(wsRev, "Recipient")
+        dateRef = AbsRefOfLabelValue(wsRev, "Date")
+
+        If Len(recipRef) = 0 Then
+            log = log & "Front Cover 'Intended for' left alone (no Recipient on Revision Page). "
+        Else
+            WriteBelowLabel wsFront, "Intended for", _
+                            "=" & SheetRef(wsRev.Name) & "!" & recipRef, log
+        End If
+
+        If Len(dateRef) = 0 Then
+            log = log & "Front Cover 'Date' left alone (no Date on Revision Page). "
+        Else
+            WriteBelowLabel wsFront, "Date", _
+                            "=" & SheetRef(wsRev.Name) & "!" & dateRef, log
+        End If
+
+        Set frontTitle = FindTitleCell(wsFront)
+        If frontTitle Is Nothing Then
+            log = log & "No 'SCHEDULE OF...' title found on Front Cover. "
+        Else
+            PutFormula frontTitle, "=" & SheetRef(wsMeta.Name) & "!B3"
+            If frontTitle.Row > 1 Then
+                PutFormula wsFront.Cells(frontTitle.Row - 1, frontTitle.Column), _
+                           "=" & SheetRef(wsMeta.Name) & "!B4"
+            End If
+        End If
+    End If
+
+    ' --- Schedule sheet title -------------------------------------------
+    log = log & LinkScheduleSheetTitle(wbTgt, wsMeta, wsRev)
+
+    ' --- Title block printed at the top of a schedule sheet ---------------
+    log = log & LinkTitleBlock(wbTgt, wsMeta)
+
+    ' --- Revision Page title block, driven by the revision table ---------
+    log = log & WriteRevisionFormulas(wsRev)
+
+    ' --- Any other cell anywhere that ranks the revision table -----------
+    log = log & UpgradeRevisionFormulas(wbTgt)
+
+    ' --- Suitability dropdown, kept local so it survives without the MPI --
+    log = log & WriteStatusList(wsMeta, wsRev, statuses)
+
+    ' --- Anything hand-written that got externalised by a sheet copy ------
+    log = log & LocaliseFormulas(wbTgt)
+
+    ' --- References to some other MAINPROJECTINFO ------------------------
+    log = log & RepointStrayMpiRefs(wbTgt, mpiName, setupSheetName)
+
+    ' --- Housekeeping ----------------------------------------------------
+    log = log & RemoveDeadNames(wbTgt)
+    log = log & TidyLinks(wbTgt, mpiName)
+
+    RepairWorkbook = Trim$(log)
+End Function
+
+
+' Writes the Metadata sheet content. Rows 4-6 are the only MPI links.
+Private Function WriteMetadata(ByVal wsMeta As Worksheet, ByVal wsRev As Worksheet, _
+                               ByVal mpiPrefix As String, _
+                               ByVal projNameRef As String, ByVal projNoRef As String, _
+                               ByVal clientRef As String, ByVal fields As Variant) As String
+    Dim lo As ListObject
+    Dim log As String
+    Dim rv As String
+    Dim lastRow As Long
+    Dim i As Long
+
+    rv = SheetRef(wsRev.Name) & "!"
+
+    ' Grow the table first so the writes land inside it.
+    On Error Resume Next
+    Set lo = wsMeta.ListObjects(1)
+    On Error GoTo 0
+    lastRow = META_LAST_ROW + FieldCount(fields)
+    If Not lo Is Nothing Then
+        On Error Resume Next
+        lo.Resize wsMeta.Range("A1:B" & lastRow)
+        On Error GoTo 0
+    End If
+
+    wsMeta.Range("A1").Value = "Header"
+    wsMeta.Range("B1").Value = "Value"
+
+    wsMeta.Range("A2").Value = "DocumentNumber"
+    ' The file name is the document number. Two conventions are in use:
+    '   "<doc no> - Schedule Name.xlsx"   the tail is dropped
+    '   "<doc no>.xlsx"                   the whole name is the number
+    ' Splitting on the last hyphen, as this used to, ate the last segment of
+    ' names that carry no schedule name after a " - ".
+    PutFormula wsMeta.Range("B2"), _
+        "=IFERROR(LET(" & _
+        "raw,TEXTBEFORE(TEXTAFTER(CELL(""filename"",A1),""[""),""]"")," & _
+        "base,TEXTBEFORE(raw,""."",-1)," & _
+        "IF(ISNUMBER(SEARCH("" - "",base)),TRIM(TEXTBEFORE(base,"" - "")),TRIM(base))" & _
+        "),"""")"
+
+    wsMeta.Range("A3").Value = "ScheduleName"
+    PutFormula wsMeta.Range("B3"), "=TRIM(" & rv & "$A$4)"
+
+    wsMeta.Range("A4").Value = "Project Name"
+    PutFormula wsMeta.Range("B4"), "=" & mpiPrefix & projNameRef
+
+    wsMeta.Range("A5").Value = "Project Number"
+    PutFormula wsMeta.Range("B5"), "=" & mpiPrefix & projNoRef
+
+    wsMeta.Range("A6").Value = "Client"
+    PutFormula wsMeta.Range("B6"), "=" & mpiPrefix & clientRef
+
+    ' Rows 7-14 mirror the Revision Page title block so the MPI can read one
+    ' sheet per schedule instead of hunting for labels in a formatted page.
+    log = log & MetaRow(wsMeta, 7, "DocumentType", wsRev, "Document type")
+    log = log & MetaRow(wsMeta, 8, "Revision", wsRev, "Revision")
+    log = log & MetaRow(wsMeta, 9, "Date", wsRev, "Date")
+    log = log & MetaRow(wsMeta, 10, "Prepared by", wsRev, "Prepared by")
+    log = log & MetaRow(wsMeta, 11, "Checked by", wsRev, "Checked by")
+    log = log & MetaRow(wsMeta, 12, "Approved by", wsRev, "Approved by")
+    log = log & MetaRow(wsMeta, 13, "Suitability Status", wsRev, "Suitability Status")
+    log = log & MetaRow(wsMeta, 14, "Suitability Description", wsRev, "Suitability Description")
+
+    ' Extra project fields from the MPI, one row each after the fixed ones.
+    ' Rewritten in full every run, so removing a field on the MPI removes it
+    ' from every schedule too.
+    wsMeta.Range("A" & (META_LAST_ROW + 1) & ":B" & (META_LAST_ROW + 60)).ClearContents
+    For i = 1 To FieldCount(fields)
+        wsMeta.Cells(META_LAST_ROW + i, 1).Value = fields(i, 1)
+        PutFormula wsMeta.Cells(META_LAST_ROW + i, 2), "=" & mpiPrefix & fields(i, 2)
+    Next i
+
+    wsMeta.Range("B9").NumberFormat = "dd/mm/yyyy"
+    wsMeta.Columns("A:B").AutoFit
+
+    ' The title cell on the Revision Page is the one place a schedule name is
+    ' typed. Make sure it is not itself a formula pointing somewhere else.
+    If wsRev.Range("A4").HasFormula Then
+        log = log & "Revision Page A4 (schedule name) is a formula - it should be typed text. "
+    End If
+
+    WriteMetadata = log
+End Function
+
+
+Public Function FieldCount(ByVal fields As Variant) As Long
+    On Error Resume Next
+    If IsArray(fields) Then FieldCount = UBound(fields, 1)
+    If Err.Number <> 0 Then
+        Err.Clear
+        FieldCount = 0
+    End If
+    On Error GoTo 0
+End Function
+
+
+' Points any Revision Page label that matches a project field at the Metadata
+' row holding it. Add "DfE Code" to column A of the reference schedule''s
+' Revision Page, and every schedule picks the value up from the MPI.
+Private Function LinkProjectFields(ByVal wsRev As Worksheet, ByVal wsMeta As Worksheet, _
+                                   ByVal fields As Variant) As String
+    Dim i As Long, n As Long
+    Dim lbl As Range
+    Dim wired As Long
+
+    n = FieldCount(fields)
+    If n = 0 Then Exit Function
+
+    For i = 1 To n
+        Set lbl = FindLabel(wsRev, CStr(fields(i, 1)))
+        If Not lbl Is Nothing Then
+            PutFormula lbl.Offset(0, 1), _
+                "=" & SheetRef(wsMeta.Name) & "!B" & (META_LAST_ROW + i)
+            wired = wired + 1
+        End If
+    Next i
+
+    If wired > 0 Then _
+        LinkProjectFields = "Linked " & wired & " project field(s) on the Revision Page. "
+End Function
+
+
+Private Function MetaRow(ByVal wsMeta As Worksheet, ByVal metaRowNo As Long, _
+                         ByVal header As String, ByVal wsRev As Worksheet, _
+                         ByVal revLabel As String) As String
+    Dim lbl As Range
+    wsMeta.Cells(metaRowNo, 1).Value = header
+    Set lbl = FindLabel(wsRev, revLabel)
+    If lbl Is Nothing Then
+        wsMeta.Cells(metaRowNo, 2).ClearContents
+        MetaRow = "Revision Page has no '" & revLabel & "' label. "
+    Else
+        PutFormula wsMeta.Cells(metaRowNo, 2), _
+            "=" & SheetRef(wsRev.Name) & "!" & AbsRef(lbl.Offset(0, 1))
+    End If
+End Function
+
+
+' "$B$15" for the value cell next to a Revision Page label, or "" if the
+' label is not there. Never guesses - a wrong guess is worse than no link.
+Private Function AbsRefOfLabelValue(ByVal ws As Worksheet, ByVal labelText As String) As String
+    Dim lbl As Range
+    Set lbl = FindLabel(ws, labelText)
+    If lbl Is Nothing Then Exit Function
+    AbsRefOfLabelValue = AbsRef(lbl.Offset(0, 1))
+End Function
+
+
+Private Sub WriteIfLabelled(ByVal ws As Worksheet, ByVal labelText As String, _
+                            ByVal f As String, ByRef log As String)
+    Dim lbl As Range
+    Set lbl = FindLabel(ws, labelText)
+    If lbl Is Nothing Then
+        log = log & "No '" & labelText & "' label on " & ws.Name & ". "
+    Else
+        PutFormula lbl.Offset(0, 1), f
+    End If
+End Sub
+
+
+Private Sub WriteBelowLabel(ByVal ws As Worksheet, ByVal labelText As String, _
+                            ByVal f As String, ByRef log As String)
+    Dim lbl As Range
+    Set lbl = FindLabel(ws, labelText)
+    If lbl Is Nothing Then
+        log = log & "No '" & labelText & "' label on " & ws.Name & ". "
+    Else
+        PutFormula lbl.Offset(1, 0), f
+    End If
+End Sub
+
+
+' The schedule sheet's own title is linked to Metadata only when it already
+' matches the Revision Page title. If they disagree we report it rather than
+' silently overwrite whichever one the engineer meant.
+Private Function LinkScheduleSheetTitle(ByVal wb As Workbook, ByVal wsMeta As Worksheet, _
+                                        ByVal wsRev As Worksheet) As String
+    Dim ws As Worksheet
+    Dim t As Range
+    Dim master As String
+
+    master = Trim$(CStr(wsRev.Range("A4").Value))
+    If Len(master) = 0 Then Exit Function
+
+    For Each ws In wb.Worksheets
+        If Not IsCommonSheet(ws) Then
+            Set t = FindTitleCell(ws)
+            If Not t Is Nothing Then
+                If t.HasFormula Then
+                    ' already linked, leave it
+                ElseIf StrComp(Trim$(CStr(t.Value)), master, vbTextCompare) = 0 Then
+                    PutFormula t, "=" & SheetRef(wsMeta.Name) & "!B3"
+                Else
+                    LinkScheduleSheetTitle = LinkScheduleSheetTitle & _
+                        "Title on '" & ws.Name & "' (" & Trim$(CStr(t.Value)) & _
+                        ") differs from Revision Page A4 (" & master & ") - left alone. "
+                End If
+            End If
+        End If
+    Next ws
+End Function
+
+
+' Wires the title block some schedules print across the top of the sheet
+' itself, the one that repeats on every page through Print Titles.
+'
+' Those cells hold the label and the value together in one merged cell:
+'
+'     "CLIENT: Example Contractor Ltd"
+'
+' so they become a concatenation of the label and the Metadata value. The cell
+' reads exactly as before and keeps its formatting; it just stops being typed.
+'
+' Label spelling varies across files - CLIENT / CLIENTS, DOCUMENT REFERENCE /
+' DOCUMENTS REFERENCE, one "CHECKED BY:l" - so the text before the colon is
+' matched loosely and rewritten to one spelling. Every change is logged.
+Private Function LinkTitleBlock(ByVal wb As Workbook, ByVal wsMeta As Worksheet) As String
+    Dim ws As Worksheet
+    Dim cell As Range
+    Dim r As Long, c As Long
+    Dim v As Variant
+    Dim canonical As String
+    Dim metaRow As Long
+    Dim asDate As Boolean
+    Dim wired As Long
+    Dim renamed As String
+
+    For Each ws In wb.Worksheets
+        If Not IsCommonSheet(ws) Then
+            For r = 1 To TITLE_BLOCK_ROWS
+                For c = 1 To TITLE_BLOCK_COLS
+                    Set cell = ws.Cells(r, c)
+
+                    ' Only the anchor of a merged block can be written to.
+                    If cell.Address = cell.MergeArea.Cells(1, 1).Address Then
+                        v = cell.Value
+                        If VarType(v) = vbString Then
+                            If InStr(v, ":") > 0 Then
+                                metaRow = 0
+                                asDate = False
+                                canonical = TitleBlockField(LabelKey(CStr(v)), metaRow, asDate)
+
+                                If Len(canonical) > 0 And metaRow > 0 Then
+                                    If Not cell.HasFormula Then
+                                        If StrComp(LabelKey(CStr(v)), canonical, vbTextCompare) <> 0 Then
+                                            renamed = renamed & "'" & Trim$(Left$(CStr(v), _
+                                                      InStr(v, ":"))) & "' to '" & canonical & ":'; "
+                                        End If
+                                        PutFormula cell, TitleBlockFormula(wsMeta, canonical, metaRow, asDate)
+                                        wired = wired + 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                Next c
+            Next r
+        End If
+    Next ws
+
+    If wired > 0 Then LinkTitleBlock = "Linked " & wired & " title block cell(s). "
+    If Len(renamed) > 0 Then LinkTitleBlock = LinkTitleBlock & "Label spelling standardised: " & renamed
+End Function
+
+
+Private Function TitleBlockFormula(ByVal wsMeta As Worksheet, ByVal canonical As String, _
+                                   ByVal metaRow As Long, ByVal asDate As Boolean) As String
+    Dim valueRef As String
+    valueRef = SheetRef(wsMeta.Name) & "!B" & metaRow
+    If asDate Then valueRef = "TEXT(" & valueRef & ",""dd/mm/yyyy"")"
+    TitleBlockFormula = "=""" & canonical & ": ""&" & valueRef
+End Function
+
+
+' "CLIENT: Example Contractor Ltd" -> "CLIENT". Everything from the colon on is the
+' value, whatever it happens to be.
+Private Function LabelKey(ByVal cellText As String) As String
+    Dim s As String
+    Dim p As Long
+
+    s = Trim$(cellText)
+    p = InStr(s, ":")
+    If p > 0 Then s = Left$(s, p - 1)
+    s = UCase$(Trim$(s))
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    LabelKey = s
+End Function
+
+
+' The one spelling of each title block label, and the Metadata row behind it.
+' Add a spelling to a Case to have it recognised and corrected.
+Private Function TitleBlockField(ByVal key As String, ByRef metaRow As Long, _
+                                 ByRef asDate As Boolean) As String
+    Select Case key
+        Case "CLIENT", "CLIENTS"
+            metaRow = 6: TitleBlockField = "CLIENT"
+        Case "PROJECT", "PROJECT NAME"
+            metaRow = 4: TitleBlockField = "PROJECT"
+        Case "PROJECT NUMBER", "PROJECT NO", "PROJECT NO.", "PROJECT NUM"
+            metaRow = 5: TitleBlockField = "PROJECT NUMBER"
+        Case "PREPARED BY"
+            metaRow = 10: TitleBlockField = "PREPARED BY"
+        Case "CHECKED BY"
+            metaRow = 11: TitleBlockField = "CHECKED BY"
+        Case "APPROVED BY"
+            metaRow = 12: TitleBlockField = "APPROVED BY"
+        Case "REVISION"
+            metaRow = 8: TitleBlockField = "REVISION"
+        Case "REVISION DATE", "DATE"
+            metaRow = 9: TitleBlockField = "REVISION DATE": asDate = True
+        Case "PURPOSE OF DOCUMENT", "SUITABILITY", "STATUS"
+            metaRow = 13: TitleBlockField = "PURPOSE OF DOCUMENT"
+        Case "DOCUMENT REFERENCE", "DOCUMENTS REFERENCE", "DOC REF", "DOCUMENT NO", "DOCUMENT NUMBER"
+            metaRow = 2: TitleBlockField = "DOCUMENTS REFERENCE"
+    End Select
+End Function
+
+
+' Puts the suitability code list on the Metadata sheet and points the
+' revision table's Status column at it.
+Private Function WriteStatusList(ByVal wsMeta As Worksheet, ByVal wsRev As Worksheet, _
+                                 ByVal statuses As Variant) As String
+    Dim i As Long, n As Long
+    Dim lo As ListObject
+    Dim col As ListColumn
+    Dim rng As Range
+
+    If Not IsArray(statuses) Then Exit Function
+    n = UBound(statuses) - LBound(statuses) + 1
+    If n < 1 Then Exit Function
+
+    wsMeta.Range("D1:D200").ClearContents
+    wsMeta.Range("D1").Value = "Suitability Codes"
+    For i = 0 To n - 1
+        wsMeta.Cells(2 + i, 4).Value = statuses(LBound(statuses) + i)
+    Next i
+    wsMeta.Columns("D").AutoFit
+
+    On Error Resume Next
+    Set lo = wsRev.ListObjects("RevisionTable")
+    On Error GoTo 0
+    If lo Is Nothing Then
+        WriteStatusList = "No 'RevisionTable' on the Revision Page. "
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set col = lo.ListColumns("Status")
+    On Error GoTo 0
+    If col Is Nothing Then
+        WriteStatusList = "RevisionTable has no 'Status' column. "
+        Exit Function
+    End If
+
+    Set rng = col.DataBodyRange
+    If rng Is Nothing Then Exit Function
+
+    On Error Resume Next
+    rng.Validation.Delete
+    rng.Validation.Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, _
+        Operator:=xlBetween, _
+        Formula1:="=" & SheetRef(wsMeta.Name) & "!$D$2:$D$" & (n + 1)
+    rng.Validation.IgnoreBlank = True
+    rng.Validation.InCellDropdown = True
+    On Error GoTo 0
+End Function
+
+
+' Rewrites references that point at another workbook's copy of a sheet this
+' workbook has itself.
+'
+' Copying a sheet in from a reference turns every formula on it that referred
+' to a sheet in the reference into an external one:
+'
+'     ='Revision Page'!B26   becomes   ='[Golden.xlsx]Revision Page'!B26
+'
+' The repair fixes the cells it writes itself, but not one somebody added by
+' hand on the cover. This catches all of them: any external reference naming a
+' sheet that exists here is pointed at the local sheet instead. References to
+' sheets this workbook does not have are left alone, because those are real
+' links to somewhere else and breaking them silently would be worse.
+Private Function LocaliseFormulas(ByVal wb As Workbook) As String
+    Dim ws As Worksheet, target As Worksheet
+    Dim rng As Range, cell As Range
+    Dim re As Object, matches As Object, m As Object
+    Dim f As String, newF As String
+    Dim sheetName As String
+    Dim changed As Long
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    ' '[Book.xlsx]Sheet Name'!  or  [Book.xlsx]SheetName!
+    ' The [^']* before the bracket is the whole point. Excel writes a
+    ' path-qualified reference whenever the other workbook is CLOSED:
+    '
+    '     ='C:\Projects\[SRP-0023.xlsx]Revision Page'!B12
+    '
+    ' and the source of a copied sheet is always closed by the time this runs.
+    ' Without it this matched only the form you get while both are open, so a
+    ' schedule whose cover had been copied from another was reported as linked
+    ' and never actually relinked.
+    re.pattern = "'[^']*\[[^\]\[]+\]([^']+)'!|\[[^\]\[]+\]([A-Za-z0-9_.]+)!"
+
+    For Each ws In wb.Worksheets
+        Set rng = Nothing
+        On Error Resume Next
+        Set rng = ws.UsedRange.SpecialCells(xlCellTypeFormulas)
+        On Error GoTo 0
+        If Not rng Is Nothing Then
+            For Each cell In rng.Cells
+                f = CellFormula(cell)
+                If InStr(f, "[") > 0 Then
+                    newF = f
+                    Set matches = re.Execute(f)
+                    For Each m In matches
+                        sheetName = m.SubMatches(0)
+                        If Len(sheetName) = 0 Then sheetName = m.SubMatches(1)
+                        Set target = GetSheet(wb, sheetName)
+                        If Not target Is Nothing Then
+                            newF = Replace(newF, m.Value, SheetRef(target.Name) & "!")
+                        End If
+                    Next m
+
+                    ' Table references lose their workbook prefix the same way.
+                    newF = RegexReplace(newF, "\[[^\]\[]+\]!(?=[A-Za-z_])", "")
+
+                    If StrComp(newF, f, vbBinaryCompare) <> 0 Then
+                        PutFormula cell, newF
+                        changed = changed + 1
+                    End If
+                End If
+            Next cell
+        End If
+    Next ws
+
+    If changed > 0 Then _
+        LocaliseFormulas = "Pointed " & changed & " formula(s) back at this workbook's own sheets. "
+End Function
+
+
+' Points a reference to somebody else's MAINPROJECTINFO at this one.
+'
+' LocaliseFormulas can only redirect a reference to a sheet this workbook has
+' itself, and no schedule has a Setup sheet. So a formula left over from
+' another project, or from before the MPI was renamed, survived every pass and
+' was merely reported as "STILL LINKED". It is now repointed: a reference to a
+' sheet called Setup, in a workbook that is not this MPI, can only have been
+' meant for this MPI.
+Private Function RepointStrayMpiRefs(ByVal wb As Workbook, ByVal mpiName As String, _
+                                     ByVal setupSheetName As String) As String
+    Dim ws As Worksheet
+    Dim rng As Range, cell As Range
+    Dim re As Object, matches As Object, m As Object
+    Dim f As String, newF As String
+    Dim bookName As String, sheetName As String
+    Dim changed As Long
+    Dim fixedBooks As Object
+
+    Set fixedBooks = CreateObject("Scripting.Dictionary")
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    ' Path-qualified when the other workbook is closed - see LocaliseFormulas.
+    re.pattern = "'[^']*\[([^\]\[]+)\]([^']+)'!|\[([^\]\[]+)\]([A-Za-z0-9_.]+)!"
+
+    For Each ws In wb.Worksheets
+        Set rng = Nothing
+        On Error Resume Next
+        Set rng = ws.UsedRange.SpecialCells(xlCellTypeFormulas)
+        On Error GoTo 0
+        If Not rng Is Nothing Then
+            For Each cell In rng.Cells
+                f = CellFormula(cell)
+                If InStr(f, "[") > 0 Then
+                    newF = f
+                    Set matches = re.Execute(f)
+                    For Each m In matches
+                        bookName = m.SubMatches(0)
+                        sheetName = m.SubMatches(1)
+                        If Len(bookName) = 0 Then
+                            bookName = m.SubMatches(2)
+                            sheetName = m.SubMatches(3)
+                        End If
+
+                        If StrComp(sheetName, setupSheetName, vbTextCompare) = 0 _
+                           And StrComp(bookName, mpiName, vbTextCompare) <> 0 Then
+                            newF = Replace(newF, m.Value, _
+                                   "'[" & mpiName & "]" & setupSheetName & "'!")
+                            fixedBooks(LCase$(bookName)) = True
+                        End If
+                    Next m
+
+                    If StrComp(newF, f, vbBinaryCompare) <> 0 Then
+                        PutFormula cell, newF
+                        changed = changed + 1
+                    End If
+                End If
+            Next cell
+        End If
+    Next ws
+
+    If changed > 0 Then _
+        RepointStrayMpiRefs = "Repointed " & changed & " formula(s) from " & _
+                              Join(fixedBooks.Keys, ", ") & " to " & mpiName & ". "
+End Function
+
+
+' Removes defined names left over from copied templates (#REF! or pointing at
+' some other workbook). These are what make Excel nag about updating links.
+Private Function RemoveDeadNames(ByVal wb As Workbook) As String
+    Dim nm As Name
+    Dim i As Long
+    Dim killed As Long
+    Dim rt As String
+    Dim re As Object
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+    re.pattern = "\[[^\]\[]+\.xls[a-z]*\]"
+
+    For i = wb.Names.Count To 1 Step -1
+        Set nm = wb.Names(i)
+        If Left$(nm.Name, 6) <> "_xlnm." And InStr(nm.Name, "!_xlnm.") = 0 Then
+            On Error Resume Next
+            rt = nm.RefersTo
+            On Error GoTo 0
+            If InStr(1, rt, "#REF!", vbTextCompare) > 0 _
+               Or re.Test(rt) Then
+                On Error Resume Next
+                nm.Delete
+                If Err.Number = 0 Then killed = killed + 1
+                Err.Clear
+                On Error GoTo 0
+            End If
+        End If
+    Next i
+
+    If killed > 0 Then RemoveDeadNames = "Removed " & killed & " broken/external defined name(s). "
+End Function
+
+
+' Repoints an existing link to a workbook with the MPI's file name at the
+' current MPI. Returns a log fragment.
+Private Function RepointMpiLink(ByVal wb As Workbook, ByVal mpiFullPath As String) As String
+    Dim links As Variant
+    Dim i As Long
+    Dim mpiName As String
+
+    mpiName = BaseName(mpiFullPath)
+
+    On Error Resume Next
+    links = wb.LinkSources(xlExcelLinks)
+    On Error GoTo 0
+    If IsEmpty(links) Then Exit Function
+
+    For i = LBound(links) To UBound(links)
+        If StrComp(BaseName(CStr(links(i))), mpiName, vbTextCompare) = 0 Then
+            If StrComp(CStr(links(i)), mpiFullPath, vbTextCompare) <> 0 Then
+                On Error Resume Next
+                wb.ChangeLink Name:=CStr(links(i)), NewName:=mpiFullPath, Type:=xlExcelLinks
+                On Error GoTo 0
+            End If
+        End If
+    Next i
+End Function
+
+
+' Breaks external links that no formula uses any more (the usual leftovers of
+' copying a schedule). Links that ARE still referenced are reported, never
+' broken - breaking one would silently hardcode a live formula.
+Private Function TidyLinks(ByVal wb As Workbook, ByVal mpiName As String) As String
+    Dim links As Variant
+    Dim used As Object
+    Dim i As Long
+    Dim src As String, nameOnly As String
+    Dim broke As Long
+    Dim log As String
+
+    On Error Resume Next
+    links = wb.LinkSources(xlExcelLinks)
+    On Error GoTo 0
+    If IsEmpty(links) Then Exit Function
+
+    Set used = ReferencedWorkbooks(wb)
+
+    For i = LBound(links) To UBound(links)
+        src = CStr(links(i))
+        nameOnly = LCase$(BaseName(src))
+        If nameOnly <> LCase$(mpiName) Then
+            If Not used.Exists(nameOnly) Then
+                On Error Resume Next
+                wb.BreakLink Name:=src, Type:=xlExcelLinks
+                Err.Clear
+                On Error GoTo 0
+                broke = broke + 1
+            Else
+                log = log & "STILL LINKED to " & BaseName(src) & " from " & _
+                      WhereReferenced(wb, BaseName(src)) & ". "
+            End If
+        End If
+    Next i
+
+    If broke > 0 Then log = log & "Cleared " & broke & " unused external link(s). "
+    TidyLinks = log
+End Function
+
+
+' The first few cells still referencing a given workbook, so a warning names
+' somewhere to look rather than just a file.
+Private Function WhereReferenced(ByVal wb As Workbook, ByVal bookName As String) As String
+    Dim ws As Worksheet
+    Dim rng As Range, cell As Range
+    Dim found As String
+    Dim n As Long
+
+    For Each ws In wb.Worksheets
+        Set rng = Nothing
+        On Error Resume Next
+        Set rng = ws.UsedRange.SpecialCells(xlCellTypeFormulas)
+        On Error GoTo 0
+        If Not rng Is Nothing Then
+            For Each cell In rng.Cells
+                If InStr(1, CellFormula(cell), "[" & bookName & "]", vbTextCompare) > 0 Then
+                    n = n + 1
+                    If n <= 3 Then
+                        found = found & IIf(Len(found) > 0, ", ", "") & _
+                                ws.Name & "!" & cell.Address(False, False)
+                    End If
+                End If
+            Next cell
+        End If
+    Next ws
+
+    If n = 0 Then
+        WhereReferenced = "a defined name or chart"
+    ElseIf n > 3 Then
+        WhereReferenced = found & " and " & (n - 3) & " more"
+    Else
+        WhereReferenced = found
+    End If
+End Function
+
+
+' Set of lower-case workbook file names referenced by any formula in wb.
+Private Function ReferencedWorkbooks(ByVal wb As Workbook) As Object
+    Dim d As Object
+    Dim ws As Worksheet
+    Dim rng As Range, cell As Range
+    Dim re As Object, matches As Object, m As Object
+    Dim f As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.pattern = "\[([^\]\[]+\.xls[a-z]*)\]"
+    re.IgnoreCase = True
+
+    For Each ws In wb.Worksheets
+        Set rng = Nothing
+        On Error Resume Next
+        Set rng = ws.UsedRange.SpecialCells(xlCellTypeFormulas)
+        On Error GoTo 0
+        If Not rng Is Nothing Then
+            For Each cell In rng.Cells
+                f = cell.Formula
+                If InStr(f, "[") > 0 Then
+                    Set matches = re.Execute(f)
+                    For Each m In matches
+                        d(LCase$(m.SubMatches(0))) = True
+                    Next m
+                End If
+            Next cell
+        End If
+    Next ws
+
+    Set ReferencedWorkbooks = d
+End Function
+
+
+' Rewrites the seven title-block cells that summarise the revision table, so
+' that they rank revisions by family (AF > C > P) and then by number.
+Private Function WriteRevisionFormulas(ByVal wsRev As Worksheet) As String
+    Dim lo As ListObject
+    Dim log As String
+
+    On Error Resume Next
+    Set lo = wsRev.ListObjects("RevisionTable")
+    On Error GoTo 0
+    If lo Is Nothing Then
+        WriteRevisionFormulas = "No 'RevisionTable' - revision formulas left alone. "
+        Exit Function
+    End If
+
+    WriteIfLabelled wsRev, "Revision", RevFormula(RevLookup("Revision"), False), log
+    WriteIfLabelled wsRev, "Date", RevFormula(RevLookup("Date"), False), log
+    WriteIfLabelled wsRev, "Prepared by", RevFormula(RevLookup("Prepared by"), False), log
+    WriteIfLabelled wsRev, "Checked by", RevFormula(RevLookup("Checked by"), False), log
+    WriteIfLabelled wsRev, "Approved by", RevFormula(RevLookup("Approved by"), False), log
+    WriteIfLabelled wsRev, "Suitability Status", _
+        RevFormula("IFERROR(LEFT(stat,FIND("" - "",stat)-1),stat)", True), log
+    WriteIfLabelled wsRev, "Suitability Description", _
+        RevFormula("IFERROR(TEXTAFTER(stat,"" - ""),"""")", True), log
+
+    WriteRevisionFormulas = log
+End Function
+
+
+' Rewrites every formula ANYWHERE in the workbook that picks the latest row
+' out of the revision table, not just the seven on the Revision Page. Catches
+' the copies that live on the front cover or in a schedule sheet header.
+'
+' Only touches cells whose formula already ranks RevisionTable[Revision] with
+' MAX(), so it cannot wander into unrelated formulas.
+Private Function UpgradeRevisionFormulas(ByVal wb As Workbook) As String
+    Dim ws As Worksheet
+    Dim rng As Range, cell As Range
+    Dim f As String, newF As String
+    Dim changed As Long
+
+    For Each ws In wb.Worksheets
+        Set rng = Nothing
+        On Error Resume Next
+        Set rng = ws.UsedRange.SpecialCells(xlCellTypeFormulas)
+        On Error GoTo 0
+        If Not rng Is Nothing Then
+            For Each cell In rng.Cells
+                f = CellFormula(cell)
+                If InStr(1, f, "RevisionTable[Revision]", vbTextCompare) > 0 _
+                   And InStr(1, f, "MAX(", vbTextCompare) > 0 Then
+                    newF = RebuildRevFormula(f)
+                    If Len(newF) > 0 And StrComp(newF, f, vbBinaryCompare) <> 0 Then
+                        PutFormula cell, newF
+                        changed = changed + 1
+                    End If
+                End If
+            Next cell
+        End If
+    Next ws
+
+    If changed > 0 Then _
+        UpgradeRevisionFormulas = "Rebuilt " & changed & " revision formula(s) with AF > C > P ranking. "
+End Function
+
+
+Private Function CellFormula(ByVal cell As Range) As String
+    On Error Resume Next
+    CellFormula = cell.Formula2
+    If Len(CellFormula) = 0 Then CellFormula = cell.Formula
+    On Error GoTo 0
+End Function
+
+
+' Works out what an existing revision formula returns, then regenerates it with
+' the family-aware ranking. Returns "" if it cannot tell, in which case the
+' original formula is left exactly as it is.
+Private Function RebuildRevFormula(ByVal f As String) As String
+    Dim re As Object, matches As Object
+    Dim i As Long
+    Dim col As String
+
+    ' The two suitability formulas split "S5 - Suitable for ..." apart.
+    If InStr(1, f, " - ", vbTextCompare) > 0 Then
+        If InStr(1, f, "FIND(", vbTextCompare) > 0 And InStr(1, f, "LEFT(", vbTextCompare) > 0 Then
+            RebuildRevFormula = RevFormula("IFERROR(LEFT(stat,FIND("" - "",stat)-1),stat)", True)
+            Exit Function
+        End If
+        If InStr(1, f, "TEXTAFTER(", vbTextCompare) > 0 Then
+            RebuildRevFormula = RevFormula("IFERROR(TEXTAFTER(stat,"" - ""),"""")", True)
+            Exit Function
+        End If
+    End If
+
+    ' Otherwise the answer column is the last RevisionTable[...] that is not
+    ' the Revision column itself.
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    re.pattern = "RevisionTable\[([^\]\[#]+)\]"
+    Set matches = re.Execute(f)
+
+    For i = 0 To matches.Count - 1
+        If StrComp(matches(i).SubMatches(0), "Revision", vbTextCompare) <> 0 Then
+            col = matches(i).SubMatches(0)
+        End If
+    Next i
+
+    If Len(col) = 0 Then
+        RebuildRevFormula = RevFormula(RevLookup("Revision"), False)
+    Else
+        RebuildRevFormula = RevFormula(RevLookup(col), False)
+    End If
+End Function
+
+
+' The latest revision's value in one RevisionTable column.
+'
+' A lookup that lands on an empty cell returns 0, not blank, which is how an
+' issued title block came to read "CHECKED BY: 0" whenever the latest line had
+' nobody in Checked by yet. Joining "" on the end turns that 0 back into an
+' empty string. Date is the exception: it has to stay a number so it can be
+' formatted, and the revision line it comes from always has a date.
+Private Function RevLookup(ByVal col As String) As String
+    If StrComp(col, "Revision", vbTextCompare) = 0 Then
+        RevLookup = "XLOOKUP(MAX(rank),rank,rev)&"""""
+    ElseIf StrComp(col, "Date", vbTextCompare) = 0 Then
+        RevLookup = "XLOOKUP(MAX(rank),rank,RevisionTable[Date])"
+    Else
+        RevLookup = "XLOOKUP(MAX(rank),rank,RevisionTable[" & col & "])&"""""
+    End If
+End Function
+
+
+' Builds the shared LET wrapper that ranks the revision table, then returns
+' whatever the caller asked for from the winning row.
+'
+'   num   the digits, e.g. AF01 -> 1
+'   pri   the family, P=1 C=2 AF=3, anything unrecognised = 0
+'   rank  pri*1000 + num, so AF01 (3001) beats C09 (2009) beats P12 (1012)
+Private Function RevFormula(ByVal resultExpr As String, ByVal needStatus As Boolean) As String
+    Dim names As Variant
+    Dim order As Variant
+    Dim subs As String, prio As String, closers As String
+    Dim i As Long, idx As Long
+
+    names = Split(REV_PREFIXES, ",")
+    order = ByLengthDesc(names)
+
+    subs = "t"
+    For i = LBound(order) To UBound(order)
+        idx = order(i)
+        subs = "SUBSTITUTE(" & subs & ",""" & UCase$(Trim$(names(idx))) & ""","""")"
+    Next i
+
+    For i = LBound(order) To UBound(order)
+        idx = order(i)
+        prio = prio & "IF(LEFT(t," & Len(Trim$(names(idx))) & ")=""" & _
+               UCase$(Trim$(names(idx))) & """," & (idx + 1) & ","
+        closers = closers & ")"
+    Next i
+    prio = prio & "0" & closers
+
+    RevFormula = "=LET(rev,RevisionTable[Revision]," & _
+                 "t,UPPER(TRIM(rev))," & _
+                 "num,IFERROR(--" & subs & ",0)," & _
+                 "pri," & prio & "," & _
+                 "rank,pri*1000+num,"
+    If needStatus Then
+        RevFormula = RevFormula & "stat,INDEX(RevisionTable[Status],XMATCH(MAX(rank),rank)),"
+    End If
+    RevFormula = RevFormula & resultExpr & ")"
+End Function
+
+
+' Indexes into arr, longest string first, so "AF" is stripped and matched
+' before "A" would be if someone ever adds one.
+Private Function ByLengthDesc(ByVal arr As Variant) As Variant
+    Dim idx() As Long
+    Dim i As Long, j As Long, t As Long
+    Dim n As Long
+
+    n = UBound(arr) - LBound(arr) + 1
+    ReDim idx(0 To n - 1)
+    For i = 0 To n - 1
+        idx(i) = i
+    Next i
+
+    For i = 0 To n - 2
+        For j = 0 To n - 2 - i
+            If Len(Trim$(arr(idx(j)))) < Len(Trim$(arr(idx(j + 1)))) Then
+                t = idx(j): idx(j) = idx(j + 1): idx(j + 1) = t
+            End If
+        Next j
+    Next i
+
+    ByLengthDesc = idx
+End Function
+
+
+' ---------------------------------------------------------------------------
+' Reading side - used by the ScheduleList refresh.
+' ---------------------------------------------------------------------------
+
+' Reads a value from a schedule's Metadata sheet by its header text.
+Public Function ReadMeta(ByVal wb As Workbook, ByVal header As String) As Variant
+    Dim wsMeta As Worksheet
+    Dim lbl As Range
+
+    ReadMeta = ""
+    Set wsMeta = GetSheet(wb, SH_META)
+    If wsMeta Is Nothing Then Exit Function
+
+    Set lbl = FindLabel(wsMeta, header, 1, META_LAST_ROW + 5)
+    If lbl Is Nothing Then Exit Function
+
+    ReadMeta = CellValue(lbl.Offset(0, 1))
+End Function
+
+
+' Appends one row to a schedule's revision table.
+Public Function AppendRevision(ByVal wb As Workbook, ByVal rev As String, ByVal status As String, _
+                               ByVal issueDate As Variant, ByVal prep As String, _
+                               ByVal chk As String, ByVal app As String, _
+                               ByVal descr As String) As String
+    Dim wsRev As Worksheet
+    Dim lo As ListObject
+    Dim target As Range
+    Dim cell As Range
+
+    Set wsRev = GetSheet(wb, SH_REV)
+    If wsRev Is Nothing Then
+        AppendRevision = "no Revision Page"
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set lo = wsRev.ListObjects("RevisionTable")
+    On Error GoTo 0
+    If lo Is Nothing Then
+        AppendRevision = "no RevisionTable"
+        Exit Function
+    End If
+
+    ' Refuse to add a revision that is already there.
+    If Not lo.ListColumns("Revision").DataBodyRange Is Nothing Then
+        For Each cell In lo.ListColumns("Revision").DataBodyRange.Cells
+            If StrComp(Trim$(CStr(cell.Value)), rev, vbTextCompare) = 0 Then
+                AppendRevision = "revision " & rev & " already present"
+                Exit Function
+            End If
+        Next cell
+    End If
+
+    Set target = NextRevisionRow(lo)
+    If target Is Nothing Then
+        AppendRevision = "could not find a row to write to"
+        Exit Function
+    End If
+
+    SetCol lo, target, "Revision", rev
+    SetCol lo, target, "Status", status
+    SetCol lo, target, "Date", issueDate
+    SetCol lo, target, "Prepared by", prep
+    SetCol lo, target, "Checked by", chk
+    SetCol lo, target, "Approved by", app
+    SetCol lo, target, "Description", descr
+End Function
+
+
+' The row a new revision belongs in: the first empty row of the table, so the
+' line lands directly under the previous revision.
+'
+' Revision tables are usually drawn with spare rows below the last entry.
+' ListRows.Add would jump past them and leave a gap, which is what makes a
+' title block look like it skipped a revision. Only when every row is used
+' does the table actually grow by one.
+Private Function NextRevisionRow(ByVal lo As ListObject) As Range
+    Dim body As Range
+    Dim i As Long, lastUsed As Long
+
+    Set body = lo.DataBodyRange
+    If body Is Nothing Then
+        Set NextRevisionRow = lo.ListRows.Add.Range
+        Exit Function
+    End If
+
+    For i = 1 To body.Rows.Count
+        If Application.WorksheetFunction.CountA(body.Rows(i)) > 0 Then lastUsed = i
+    Next i
+
+    If lastUsed < body.Rows.Count Then
+        Set NextRevisionRow = body.Rows(lastUsed + 1)
+    Else
+        Set NextRevisionRow = lo.ListRows.Add.Range
+    End If
+End Function
+
+
+Private Sub SetCol(ByVal lo As ListObject, ByVal rowRange As Range, _
+                   ByVal colName As String, ByVal v As Variant)
+    Dim idx As Long
+    On Error Resume Next
+    idx = lo.ListColumns(colName).Index
+    On Error GoTo 0
+    If idx > 0 Then rowRange.Cells(1, idx).Value = v
+End Sub
+
+
+' ===========================================================================
+' Headers and footers
+'
+' Used for the security classification banner (OFFICIAL, OFFICIAL-SENSITIVE,
+' CONFIDENTIAL, or nothing). Set one workbook up by hand, then copy it out.
+' ===========================================================================
+
+' Reads one sheet's header and footer.
+Public Function CaptureHF(ByVal ws As Worksheet) As HFSet
+    Dim h As HFSet
+
+    On Error GoTo Finish
+    With ws.PageSetup
+        h.LeftHeader = .LeftHeader
+        h.CenterHeader = .CenterHeader
+        h.RightHeader = .RightHeader
+        h.LeftFooter = .LeftFooter
+        h.CenterFooter = .CenterFooter
+        h.RightFooter = .RightFooter
+        h.DiffFirstPage = .DifferentFirstPageHeaderFooter
+        h.OddAndEven = .OddAndEvenPagesHeaderFooter
+        h.AlignMargins = .AlignMarginsHeaderFooter
+        h.ScaleWithDoc = .ScaleWithDocHeaderFooter
+
+        On Error Resume Next
+        If h.DiffFirstPage Then
+            h.FirstLeftHeader = .FirstPage.LeftHeader.Text
+            h.FirstCenterHeader = .FirstPage.CenterHeader.Text
+            h.FirstRightHeader = .FirstPage.RightHeader.Text
+            h.FirstLeftFooter = .FirstPage.LeftFooter.Text
+            h.FirstCenterFooter = .FirstPage.CenterFooter.Text
+            h.FirstRightFooter = .FirstPage.RightFooter.Text
+        End If
+        If h.OddAndEven Then
+            h.EvenLeftHeader = .EvenPage.LeftHeader.Text
+            h.EvenCenterHeader = .EvenPage.CenterHeader.Text
+            h.EvenRightHeader = .EvenPage.RightHeader.Text
+            h.EvenLeftFooter = .EvenPage.LeftFooter.Text
+            h.EvenCenterFooter = .EvenPage.CenterFooter.Text
+            h.EvenRightFooter = .EvenPage.RightFooter.Text
+        End If
+        Err.Clear
+        On Error GoTo Finish
+    End With
+
+    h.Valid = True
+
+Finish:
+    CaptureHF = h
+End Function
+
+
+' Writes one sheet's header and footer, then reads it back and checks it.
+'
+' An earlier version wrapped this in Application.PrintCommunication = False for
+' speed. That is a documented optimisation but it queues the changes rather
+' than applying them, and they can be dropped. Correctness first: 24 files is
+' a few seconds either way.
+'
+' Returns "" on success, or a PROBLEM line naming what did not stick.
+Public Function ApplyHF(ByVal ws As Worksheet, ByRef h As HFSet) As String
+    If Not h.Valid Then Exit Function
+
+    On Error GoTo HFError
+
+    With ws.PageSetup
+        .DifferentFirstPageHeaderFooter = h.DiffFirstPage
+        .OddAndEvenPagesHeaderFooter = h.OddAndEven
+        .AlignMarginsHeaderFooter = h.AlignMargins
+        .ScaleWithDocHeaderFooter = h.ScaleWithDoc
+
+        .LeftHeader = h.LeftHeader
+        .CenterHeader = h.CenterHeader
+        .RightHeader = h.RightHeader
+        .LeftFooter = h.LeftFooter
+        .CenterFooter = h.CenterFooter
+        .RightFooter = h.RightFooter
+
+        On Error Resume Next
+        If h.DiffFirstPage Then
+            .FirstPage.LeftHeader.Text = h.FirstLeftHeader
+            .FirstPage.CenterHeader.Text = h.FirstCenterHeader
+            .FirstPage.RightHeader.Text = h.FirstRightHeader
+            .FirstPage.LeftFooter.Text = h.FirstLeftFooter
+            .FirstPage.CenterFooter.Text = h.FirstCenterFooter
+            .FirstPage.RightFooter.Text = h.FirstRightFooter
+        End If
+        If h.OddAndEven Then
+            .EvenPage.LeftHeader.Text = h.EvenLeftHeader
+            .EvenPage.CenterHeader.Text = h.EvenCenterHeader
+            .EvenPage.RightHeader.Text = h.EvenRightHeader
+            .EvenPage.LeftFooter.Text = h.EvenLeftFooter
+            .EvenPage.CenterFooter.Text = h.EvenCenterFooter
+            .EvenPage.RightFooter.Text = h.EvenRightFooter
+        End If
+        Err.Clear
+        On Error GoTo HFError
+    End With
+
+    ApplyHF = VerifyHF(ws, h)
+    Exit Function
+
+HFError:
+    ApplyHF = "PROBLEM: '" & ws.Name & "' error " & Err.Number & " - " & Err.Description & ". "
+End Function
+
+
+' Reads the six sections back and reports any that did not take. This is the
+' difference between the tool saying it worked and it actually having worked.
+Private Function VerifyHF(ByVal ws As Worksheet, ByRef h As HFSet) As String
+    Dim bad As String
+
+    On Error Resume Next
+    With ws.PageSetup
+        bad = bad & Mismatch("LeftHeader", .LeftHeader, h.LeftHeader)
+        bad = bad & Mismatch("CenterHeader", .CenterHeader, h.CenterHeader)
+        bad = bad & Mismatch("RightHeader", .RightHeader, h.RightHeader)
+        bad = bad & Mismatch("LeftFooter", .LeftFooter, h.LeftFooter)
+        bad = bad & Mismatch("CenterFooter", .CenterFooter, h.CenterFooter)
+        bad = bad & Mismatch("RightFooter", .RightFooter, h.RightFooter)
+    End With
+    On Error GoTo 0
+
+    If Len(bad) > 0 Then _
+        VerifyHF = "PROBLEM: '" & ws.Name & "' did not take - " & bad
+End Function
+
+
+Private Function Mismatch(ByVal what As String, ByVal got As String, ByVal want As String) As String
+    If StrComp(Trim$(got), Trim$(want), vbBinaryCompare) <> 0 Then
+        Mismatch = what & " is [" & got & "] not [" & want & "]; "
+    End If
+End Function
+
+
+
+
+' A one-line summary of a header/footer, for the log.
+Public Function DescribeHF(ByRef h As HFSet) As String
+    Dim hdr As String, ftr As String
+    hdr = Trim$(h.LeftHeader & " " & h.CenterHeader & " " & h.RightHeader)
+    ftr = Trim$(h.LeftFooter & " " & h.CenterFooter & " " & h.RightFooter)
+    If Len(hdr) = 0 Then hdr = "(none)"
+    If Len(ftr) = 0 Then ftr = "(none)"
+    DescribeHF = "header " & hdr & " / footer " & ftr
+End Function
+
+
+' Copies headers and footers from one open workbook into another.
+'
+' Sheet matching, in order:
+'   1. a source sheet with the same name
+'   2. Front Cover and Revision Page to their namesakes
+'   3. anything else to the source's schedule sheet
+'
+' Schedule tabs are not always called "Schedule", which is why the name match
+' comes first and the role fallback second.
+'
+' Only header and footer properties are written. Orientation, paper size and
+' margins are left alone, so a landscape schedule stays landscape. Header and
+' footer text is positioned relative to whatever page the sheet is set to, so
+' the same banner is correct on both.
+Public Function CopyHeadersFootersTo(ByVal wbSrc As Workbook, ByVal wbTgt As Workbook, _
+                                     ByVal imgPath As String, ByVal imgW As Double, _
+                                     ByVal imgH As Double) As String
+    Dim wsTgt As Worksheet, wsSrc As Worksheet
+    Dim h As HFSet
+    Dim log As String
+    Dim n As Long
+
+    For Each wsTgt In wbTgt.Worksheets
+        If LCase$(Trim$(wsTgt.Name)) <> LCase$(SH_META) Then
+            Set wsSrc = MatchSourceSheet(wbSrc, wsTgt)
+            If wsSrc Is Nothing Then
+                log = log & "No source sheet for '" & wsTgt.Name & "'. "
+            Else
+                h = CaptureHF(wsSrc)
+                If h.Valid Then
+                    log = log & ApplyHF(wsTgt, h)
+                    log = log & ApplyHeaderImage(wsTgt, imgPath, imgW, imgH)
+                    n = n + 1
+                End If
+            End If
+        End If
+    Next wsTgt
+
+    CopyHeadersFootersTo = "Set " & n & " sheet(s). " & log
+End Function
+
+
+Private Function MatchSourceSheet(ByVal wbSrc As Workbook, ByVal wsTgt As Worksheet) As Worksheet
+    Dim ws As Worksheet
+
+    ' 1. same name
+    Set ws = GetSheet(wbSrc, wsTgt.Name)
+    If Not ws Is Nothing Then
+        Set MatchSourceSheet = ws
+        Exit Function
+    End If
+
+    ' 2. the two named sheets
+    Select Case LCase$(Trim$(wsTgt.Name))
+        Case LCase$(SH_FRONT)
+            Set MatchSourceSheet = GetSheet(wbSrc, SH_FRONT)
+            Exit Function
+        Case LCase$(SH_REV)
+            Set MatchSourceSheet = GetSheet(wbSrc, SH_REV)
+            Exit Function
+    End Select
+
+    ' 3. whatever the source uses for its schedule
+    Set MatchSourceSheet = GetSheet(wbSrc, "Schedule")
+    If MatchSourceSheet Is Nothing Then Set MatchSourceSheet = FirstScheduleSheet(wbSrc)
+End Function
+
+
+' Puts an image in the top-right of the header at the given size.
+'
+' Header images cannot be read out of another workbook: Excel does not keep
+' the original path, so PageSetup.RightHeaderPicture.Filename comes back empty
+' for an embedded picture. It CAN be written, though, so the image is taken
+' from a file the user picks rather than from the source workbook.
+Public Function ApplyHeaderImage(ByVal ws As Worksheet, ByVal imgPath As String, _
+                                 ByVal wPts As Double, ByVal hPts As Double) As String
+    Dim rh As String
+
+    If Len(imgPath) = 0 Then Exit Function
+
+    On Error GoTo ImgError
+
+    ' &G is the placeholder that makes the picture show. Keep any text that is
+    ' already in the right section rather than throwing it away.
+    rh = ws.PageSetup.RightHeader
+    If InStr(1, rh, "&G", vbTextCompare) = 0 Then ws.PageSetup.RightHeader = "&G" & rh
+
+    With ws.PageSetup.RightHeaderPicture
+        .fileName = imgPath
+        .LockAspectRatio = msoFalse
+        .Width = wPts
+        .Height = hPts
+    End With
+
+    If InStr(1, ws.PageSetup.RightHeader, "&G", vbTextCompare) = 0 Then
+        ApplyHeaderImage = "PROBLEM: '" & ws.Name & "' header image did not take. "
+    End If
+    Exit Function
+
+ImgError:
+    ApplyHeaderImage = "PROBLEM: '" & ws.Name & "' image error " & Err.Number & _
+                       " - " & Err.Description & ". "
+End Function
+
+
+' Native size of an image file, in points. Measured by dropping it on a
+' scratch sheet, which is the only reliable way to ask Excel.
+Public Function MeasureImage(ByVal imgPath As String, ByRef wPts As Double, _
+                             ByRef hPts As Double) As Boolean
+    Dim ws As Worksheet
+    Dim shp As Shape
+
+    If Not FileExists(imgPath) Then Exit Function
+
+    On Error GoTo Clean
+    Set ws = ThisWorkbook.Worksheets.Add
+    Set shp = ws.Shapes.AddPicture(fileName:=imgPath, LinkToFile:=msoFalse, _
+                                   SaveWithDocument:=msoTrue, Left:=0, Top:=0, _
+                                   Width:=-1, Height:=-1)
+    wPts = shp.Width
+    hPts = shp.Height
+    MeasureImage = (wPts > 0 And hPts > 0)
+
+Clean:
+    On Error Resume Next
+    If Not ws Is Nothing Then ws.Delete
+    On Error GoTo 0
+End Function
+
+
+' The first sheet that is not one of the three common ones.
+Public Function FirstScheduleSheet(ByVal wb As Workbook) As Worksheet
+    Dim ws As Worksheet
+    For Each ws In wb.Worksheets
+        If Not IsCommonSheet(ws) Then
+            Set FirstScheduleSheet = ws
+            Exit Function
+        End If
+    Next ws
+End Function
+
+
+' ===========================================================================
+' Copying the common sheets from a reference schedule
+'
+' Replaces a target's Front Cover and Revision Page wholesale with the
+' reference's, so a layout change made once - dropping a security
+' classification, moving a logo, changing the wording - lands everywhere.
+'
+' What survives the copy, because it belongs to the document rather than the
+' template:
+'
+'   the schedule title            ('Revision Page' A4)
+'   the whole revision history    (the RevisionTable rows)
+'   Document type, Delref Classification, BSUID, Trigger Events
+'
+' Everything else comes from the reference. The links are then rebuilt by the
+' normal repair, so nothing points back at the reference workbook.
+' ===========================================================================
+
+
+' Returns "" when nothing needed saying, or a log fragment. The caller runs
+' the repair afterwards and saves.
+Public Function CopyCommonSheetsTo(ByVal wbSrc As Workbook, ByVal wbTgt As Workbook, _
+                                   ByVal fileName As String) As String
+    Dim wsSrcFront As Worksheet, wsSrcRev As Worksheet
+    Dim wsRev As Worksheet, wsFront As Worksheet
+    Dim rd As RevData
+    Dim keeps As Object
+    Dim title As String
+    Dim idxFront As Long, idxRev As Long
+    Dim log As String
+    Dim hadSheets As Boolean
+
+    Set wsSrcFront = GetSheet(wbSrc, SH_FRONT)
+    Set wsSrcRev = GetSheet(wbSrc, SH_REV)
+    If wsSrcRev Is Nothing Then
+        CopyCommonSheetsTo = "PROBLEM: the reference has no '" & SH_REV & "' sheet. "
+        Exit Function
+    End If
+
+    Set wsRev = GetSheet(wbTgt, SH_REV)
+    Set wsFront = GetSheet(wbTgt, SH_FRONT)
+    hadSheets = Not (wsRev Is Nothing)
+
+    ' --- everything that belongs to this document, before anything is deleted
+    If wsRev Is Nothing Then
+        ' A schedule that has never had these sheets. It gets them from the
+        ' reference with an empty revision table, and its title is taken from
+        ' the schedule sheet, or failing that from the file name.
+        log = log & "No Revision Page - creating one from the reference. "
+        title = TitleFromWorkbook(wbTgt, fileName)
+        idxRev = wbTgt.Worksheets.Count + 1
+        idxFront = idxRev
+    Else
+        title = CapturedTitle(wsRev)
+        rd = CaptureRevisions(wsRev)
+        Set keeps = CaptureKeeps(wsRev)
+
+        If Not rd.Valid Then log = log & "No RevisionTable found to preserve. "
+        If Len(title) = 0 Then title = TitleFromWorkbook(wbTgt, fileName)
+
+        idxRev = wsRev.Index
+        If wsFront Is Nothing Then idxFront = idxRev Else idxFront = wsFront.Index
+    End If
+
+    If Len(title) = 0 Then log = log & "PROBLEM: could not work out a schedule title. "
+
+    ' --- swap the sheets -------------------------------------------------
+    ' Only drop the old Front Cover if there is one coming to replace it.
+    If Not wsFront Is Nothing And Not wsSrcFront Is Nothing Then wsFront.Delete
+    If Not wsRev Is Nothing Then wsRev.Delete
+
+    If Not wsSrcFront Is Nothing Then
+        log = log & PlaceCopy(wsSrcFront, wbTgt, SH_FRONT, idxFront)
+    End If
+    log = log & PlaceCopy(wsSrcRev, wbTgt, SH_REV, idxRev)
+
+    Set wsRev = GetSheet(wbTgt, SH_REV)
+    If wsRev Is Nothing Then
+        CopyCommonSheetsTo = log & "PROBLEM: the copied Revision Page did not arrive. "
+        Exit Function
+    End If
+
+    ' --- put the document's own content back ------------------------------
+    NameRevisionTable wsRev
+    If Len(title) > 0 Then SetTitle wsRev, title
+    log = log & RestoreRevisions(wsRev, rd)
+    RestoreKeeps wsRev, keeps
+
+    ' Say what happened even when it all went right. A silent success reads
+    ' exactly like having done nothing, which is how this looked before.
+    log = IIf(hadSheets, "Replaced Front Cover and Revision Page. ", _
+                         "Added Front Cover and Revision Page. ") & log
+    If rd.Valid Then log = log & "Kept " & rd.RowCount & " revision line(s). "
+    If Len(title) > 0 Then log = log & "Title '" & title & "'. "
+
+    CopyCommonSheetsTo = log
+End Function
+
+
+' Copies one sheet in, gives it the right name and puts it back where the old
+' one was. Excel names a copy "Revision Page (2)" when the name is taken, so
+' the old sheet has to be gone first, which it is.
+Private Function PlaceCopy(ByVal wsSrc As Worksheet, ByVal wbTgt As Workbook, _
+                           ByVal wantName As String, ByVal wantIndex As Long) As String
+    Dim ws As Worksheet
+
+    On Error GoTo Failed
+    wsSrc.Copy After:=wbTgt.Worksheets(wbTgt.Worksheets.Count)
+    Set ws = wbTgt.Worksheets(wbTgt.Worksheets.Count)
+    ws.Name = wantName
+
+    If wantIndex >= 1 And wantIndex <= wbTgt.Worksheets.Count Then
+        ws.Move Before:=wbTgt.Worksheets(wantIndex)
+    End If
+    Exit Function
+
+Failed:
+    PlaceCopy = "PROBLEM: could not place '" & wantName & "' - " & Err.Description & ". "
+End Function
+
+
+' A title for a schedule that has no Revision Page to take one from: the
+' "SCHEDULE OF ..." heading on its own sheet, or the tail of the file name.
+Private Function TitleFromWorkbook(ByVal wb As Workbook, ByVal fileName As String) As String
+    Dim ws As Worksheet
+    Dim t As Range
+    Dim tail As String
+
+    For Each ws In wb.Worksheets
+        If Not IsCommonSheet(ws) Then
+            Set t = FindTitleCell(ws)
+            If Not t Is Nothing Then
+                TitleFromWorkbook = Trim$(CStr(t.Value))
+                Exit Function
+            End If
+        End If
+    Next ws
+
+    tail = fileName
+    If InStrRev(tail, ".") > 1 Then tail = Left$(tail, InStrRev(tail, ".") - 1)
+    If InStr(tail, " - ") > 0 Then tail = Mid$(tail, InStrRev(tail, " - ") + 3)
+    TitleFromWorkbook = Trim$(tail)
+End Function
+
+
+Private Function CapturedTitle(ByVal wsRev As Worksheet) As String
+    Dim t As Range
+    Set t = FindTitleCell(wsRev)
+    If t Is Nothing Then Exit Function
+    CapturedTitle = Trim$(CStr(t.Value))
+End Function
+
+
+Private Sub SetTitle(ByVal wsRev As Worksheet, ByVal title As String)
+    Dim t As Range
+    Set t = FindTitleCell(wsRev)
+    If t Is Nothing Then Exit Sub
+    t.Value = title
+End Sub
+
+
+' The revision history, headers included so it can be written back by name
+' even if the reference has reordered the columns.
+Private Function CaptureRevisions(ByVal wsRev As Worksheet) As RevData
+    Dim rd As RevData
+    Dim lo As ListObject
+    Dim body As Range
+    Dim r As Long, c As Long, used As Long
+
+    On Error Resume Next
+    Set lo = wsRev.ListObjects("RevisionTable")
+    On Error GoTo 0
+    If lo Is Nothing Then
+        CaptureRevisions = rd
+        Exit Function
+    End If
+
+    rd.ColCount = lo.ListColumns.Count
+    ReDim rd.Headers(1 To rd.ColCount)
+    For c = 1 To rd.ColCount
+        rd.Headers(c) = CStr(lo.ListColumns(c).Name)
+    Next c
+
+    Set body = lo.DataBodyRange
+    If Not body Is Nothing Then
+        For r = 1 To body.Rows.Count
+            If Application.WorksheetFunction.CountA(body.Rows(r)) > 0 Then used = r
+        Next r
+    End If
+
+    rd.RowCount = used
+    If used > 0 Then
+        ReDim rd.Cells(1 To used, 1 To rd.ColCount)
+        For r = 1 To used
+            For c = 1 To rd.ColCount
+                rd.Cells(r, c) = body.Cells(r, c).Value
+            Next c
+        Next r
+    End If
+
+    rd.Valid = True
+    CaptureRevisions = rd
+End Function
+
+
+' Writes the captured history into the freshly copied table. The body is
+' always cleared first, so a schedule with no history does not inherit the
+' reference's.
+Private Function RestoreRevisions(ByVal wsRev As Worksheet, ByRef rd As RevData) As String
+    Dim lo As ListObject
+    Dim r As Long, c As Long, tgtCol As Long
+    Dim need As Long
+
+    On Error Resume Next
+    Set lo = wsRev.ListObjects("RevisionTable")
+    On Error GoTo 0
+    If lo Is Nothing Then
+        RestoreRevisions = "PROBLEM: no RevisionTable on the copied Revision Page. "
+        Exit Function
+    End If
+
+    On Error GoTo Failed
+
+    If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.ClearContents
+
+    If Not rd.Valid Or rd.RowCount = 0 Then Exit Function
+
+    ' Grow the table if this schedule has more revisions than the reference.
+    need = rd.RowCount
+    Do While lo.ListRows.Count < need
+        lo.ListRows.Add
+    Loop
+
+    For r = 1 To rd.RowCount
+        For c = 1 To rd.ColCount
+            tgtCol = ColumnIndexByName(lo, rd.Headers(c))
+            If tgtCol > 0 Then lo.DataBodyRange.Cells(r, tgtCol).Value = rd.Cells(r, c)
+        Next c
+    Next r
+    Exit Function
+
+Failed:
+    RestoreRevisions = "PROBLEM: revision history not fully restored - " & Err.Description & ". "
+End Function
+
+
+Private Function ColumnIndexByName(ByVal lo As ListObject, ByVal colName As String) As Long
+    Dim i As Long
+    For i = 1 To lo.ListColumns.Count
+        If StrComp(lo.ListColumns(i).Name, colName, vbTextCompare) = 0 Then
+            ColumnIndexByName = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+' Typed values next to the labels that are per document, not per template.
+Private Function CaptureKeeps(ByVal wsRev As Worksheet) As Object
+    Dim d As Object
+    Dim names As Variant
+    Dim i As Long
+    Dim lbl As Range
+
+    Set d = CreateObject("Scripting.Dictionary")
+    Set CaptureKeeps = d
+
+    names = Split(KEEP_LABELS, ",")
+    For i = LBound(names) To UBound(names)
+        Set lbl = FindLabel(wsRev, Trim$(CStr(names(i))))
+        If Not lbl Is Nothing Then
+            If Not lbl.Offset(0, 1).HasFormula Then
+                d(Trim$(CStr(names(i)))) = lbl.Offset(0, 1).Value
+            End If
+        End If
+    Next i
+End Function
+
+
+Private Sub RestoreKeeps(ByVal wsRev As Worksheet, ByVal keeps As Object)
+    Dim k As Variant
+    Dim lbl As Range
+
+    If keeps Is Nothing Then Exit Sub
+    For Each k In keeps.Keys
+        Set lbl = FindLabel(wsRev, CStr(k))
+        If Not lbl Is Nothing Then lbl.Offset(0, 1).Value = keeps(k)
+    Next k
+End Sub
+
+
+' A copied table can arrive as "RevisionTable1" if the name was taken. It is
+' not, because the old sheet is deleted first, but make sure of it: every
+' revision formula in the workbook refers to it by name.
+Private Sub NameRevisionTable(ByVal wsRev As Worksheet)
+    Dim lo As ListObject
+    If wsRev.ListObjects.Count = 0 Then Exit Sub
+    Set lo = wsRev.ListObjects(1)
+    If StrComp(lo.Name, "RevisionTable", vbTextCompare) = 0 Then Exit Sub
+    On Error Resume Next
+    lo.Name = "RevisionTable"
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
+' Sheet tidying
+'
+' Puts every workbook in the same order - Front Cover, Revision Page, the
+' schedule, then Metadata hidden at the end - and gives a lone schedule sheet
+' still called Sheet1 a proper name.
+'
+' Only names, order and visibility change. Nothing on any sheet is touched.
+' ===========================================================================
+Public Function TidySheetsIn(ByVal wb As Workbook) As String
+    Dim log As String
+
+    log = log & NameScheduleSheet(wb)
+    log = log & OrderSheets(wb)
+    log = log & HideMetadata(wb)
+
+    TidySheetsIn = log
+End Function
+
+
+' A workbook with exactly one schedule sheet gets it called "Schedule".
+' One with several is left alone: they cannot all take the same name, and
+' their names are the only thing telling them apart.
+Private Function NameScheduleSheet(ByVal wb As Workbook) As String
+    Dim ws As Worksheet
+    Dim only As Worksheet
+    Dim n As Long
+    Dim wasCalled As String
+
+    For Each ws In wb.Worksheets
+        If Not IsCommonSheet(ws) Then
+            n = n + 1
+            Set only = ws
+        End If
+    Next ws
+
+    If n = 0 Then
+        NameScheduleSheet = "No schedule sheet at all. "
+        Exit Function
+    End If
+
+    If n > 1 Then
+        NameScheduleSheet = n & " schedule sheets - names left as they are. "
+        Exit Function
+    End If
+
+    If StrComp(only.Name, SH_SCHEDULE, vbTextCompare) = 0 Then Exit Function
+
+    wasCalled = only.Name
+    On Error GoTo Failed
+    only.Name = SH_SCHEDULE
+    NameScheduleSheet = "Renamed '" & wasCalled & "' to '" & SH_SCHEDULE & "'. "
+    Exit Function
+
+Failed:
+    NameScheduleSheet = "PROBLEM: could not rename '" & wasCalled & "' - " & Err.Description & ". "
+End Function
+
+
+' Front Cover first, Revision Page second, Metadata last. Schedule sheets keep
+' their existing order in between.
+Private Function OrderSheets(ByVal wb As Workbook) As String
+    Dim ws As Worksheet
+    Dim wanted As Variant
+    Dim i As Long, pos As Long
+
+    On Error GoTo Failed
+
+    wanted = Array(SH_FRONT, SH_REV)
+    For i = LBound(wanted) To UBound(wanted)
+        Set ws = GetSheet(wb, CStr(wanted(i)))
+        If Not ws Is Nothing Then
+            pos = pos + 1
+            If ws.Index <> pos Then ws.Move Before:=wb.Worksheets(pos)
+        End If
+    Next i
+
+    Set ws = GetSheet(wb, SH_META)
+    If Not ws Is Nothing Then
+        If ws.Index <> wb.Worksheets.Count Then _
+            ws.Move After:=wb.Worksheets(wb.Worksheets.Count)
+    End If
+    Exit Function
+
+Failed:
+    OrderSheets = "PROBLEM: could not reorder the sheets - " & Err.Description & _
+                  " (is the workbook structure protected?). "
+End Function
+
+
+' Metadata is written by the tool and read by formulas; nobody needs to look
+' at it. Hidden, not very hidden, so it can still be unhidden by hand.
+' The other three are made sure to be visible.
+Private Function HideMetadata(ByVal wb As Workbook) As String
+    Dim ws As Worksheet
+    Dim wsMeta As Worksheet
+
+    On Error GoTo Failed
+
+    For Each ws In wb.Worksheets
+        If StrComp(ws.Name, SH_META, vbTextCompare) <> 0 Then
+            If ws.Visible <> xlSheetVisible Then ws.Visible = xlSheetVisible
+        End If
+    Next ws
+
+    Set wsMeta = GetSheet(wb, SH_META)
+    If wsMeta Is Nothing Then Exit Function
+
+    If wsMeta.Visible <> xlSheetHidden Then
+        wsMeta.Visible = xlSheetHidden
+        HideMetadata = "Metadata hidden. "
+    End If
+    Exit Function
+
+Failed:
+    HideMetadata = "PROBLEM: could not set sheet visibility - " & Err.Description & ". "
+End Function
+
+
+' ===========================================================================
+' Exporting to PDF
+'
+' The workbook is opened and closed by the caller; nothing here writes to it.
+' Selecting sheets does mark it as changed, which is why the caller closes
+' with SaveChanges:=False.
+' ===========================================================================
+
+' Returns the note for the log. A note containing "PROBLEM:" is a failure.
+' `made` is raised by one for every PDF actually written, which is how the
+' caller tells an export from a workbook that had nothing to give.
+Public Function ExportWorkbookToPdf(ByVal wb As Workbook, ByVal outFolder As String, _
+                                    ByVal perSheet As Boolean, ByVal overwrite As Boolean, _
+                                    ByRef made As Long) As String
+    Dim sheetList As Collection
+    Dim stem As String, outPath As String
+    Dim res As String, notes As String
+    Dim madeHere As Long, skippedExisting As Long
+    Dim i As Long
+
+    Set sheetList = PrintableSheets(wb)
+    If sheetList.Count = 0 Then Exit Function
+
+    stem = NameWithoutExtension(wb.Name)
+
+    If Not LooksLikeSchedule(wb) Then notes = "No Revision Page, exported anyway. "
+
+    If perSheet Then
+        For i = 1 To sheetList.Count
+            outPath = EndSep(outFolder) & SafeName(stem & " - " & sheetList(i)) & ".pdf"
+            If FileExists(outPath) And Not overwrite Then
+                skippedExisting = skippedExisting + 1
+            Else
+                res = WritePdf(wb, Array(sheetList(i)), outPath)
+                If Len(res) > 0 Then
+                    ExportWorkbookToPdf = notes & res
+                    Exit Function
+                End If
+                made = made + 1
+                madeHere = madeHere + 1
+            End If
+        Next i
+
+        If madeHere > 0 Then notes = notes & madeHere & " sheet(s) exported. "
+        If skippedExisting > 0 Then
+            notes = notes & skippedExisting & " sheet(s) already had a PDF and were skipped. "
+        End If
+    Else
+        outPath = EndSep(outFolder) & SafeName(stem) & ".pdf"
+        If FileExists(outPath) And Not overwrite Then
+            ExportWorkbookToPdf = notes & "A PDF of that name is already there. "
+            Exit Function
+        End If
+
+        If CoversAllVisible(wb, sheetList) Then
+            res = WritePdf(wb, Empty, outPath)
+        Else
+            res = WritePdf(wb, ToArray(sheetList), outPath)
+        End If
+        If Len(res) > 0 Then
+            ExportWorkbookToPdf = notes & res
+            Exit Function
+        End If
+        made = made + 1
+        notes = notes & sheetList.Count & " sheet(s): " & JoinCollection(sheetList, ", ") & ". "
+    End If
+
+    ExportWorkbookToPdf = notes
+End Function
+
+
+' The sheets worth printing, in tab order.
+'
+' Metadata is working data, never issued, so it is left out by name as well as
+' by being hidden: a workbook that has not been through Tidy sheets may still
+' have it visible.
+Private Function PrintableSheets(ByVal wb As Workbook) As Collection
+    Dim c As New Collection
+    Dim ws As Worksheet
+
+    Set PrintableSheets = c
+    For Each ws In wb.Worksheets
+        If ws.Visible = xlSheetVisible Then
+            If LCase$(Trim$(ws.Name)) <> LCase$(SH_META) Then
+                If HasSomethingToPrint(ws) Then c.Add ws.Name
+            End If
+        End If
+    Next ws
+End Function
+
+
+' An empty sheet in the selection fails the whole export, so they are filtered
+' out rather than left to break a file that would otherwise have been fine.
+Private Function HasSomethingToPrint(ByVal ws As Worksheet) As Boolean
+    Dim pa As String
+
+    On Error Resume Next
+    pa = ws.PageSetup.PrintArea
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+
+    If Len(pa) > 0 Then
+        HasSomethingToPrint = True
+        Exit Function
+    End If
+
+    If ws.Shapes.Count > 0 Then
+        HasSomethingToPrint = True
+        Exit Function
+    End If
+
+    On Error Resume Next
+    HasSomethingToPrint = (Application.WorksheetFunction.CountA(ws.UsedRange) > 0)
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+
+' Writes one PDF. `sheetNames` is a 0-based array of names, or Empty for the
+' whole workbook. Returns "" on success, otherwise a note beginning "PROBLEM:".
+'
+' ExportAsFixedFormat is a method of a Workbook, a Worksheet or a Chart. It is
+' NOT a method of the Sheets collection, so ActiveWindow.SelectedSheets.Export...
+' does not even compile. Several sheets as one document is done the way the
+' Publish dialog does it: select them, then export the ACTIVE SHEET, which
+' means "active sheet(s)" and takes the whole selected group with continuous
+' page numbers.
+Private Function WritePdf(ByVal wb As Workbook, ByVal sheetNames As Variant, _
+                          ByVal outPath As String) As String
+    Dim source As Object
+
+    If Len(outPath) > MAX_PDF_PATH Then
+        WritePdf = "PROBLEM: the PDF path would be " & Len(outPath) & " characters, " & _
+                   "which is longer than Windows allows. Export to a folder nearer " & _
+                   "the top of the drive. "
+        Exit Function
+    End If
+
+    ' Excel will not overwrite a file carrying the read-only attribute, and
+    ' fails with "Document not saved" rather than saying so. By the time this
+    ' is called the caller has decided the file is to be replaced.
+    WritePdf = ClearTarget(outPath)
+    If Len(WritePdf) > 0 Then Exit Function
+
+    On Error Resume Next
+
+    If IsEmpty(sheetNames) Then
+        Set source = wb
+    Else
+        wb.Activate
+        wb.Worksheets(sheetNames).Select
+        If Err.Number <> 0 Then
+            WritePdf = "PROBLEM: could not select the sheets - " & Err.Description & ". "
+            Err.Clear
+            Exit Function
+        End If
+        ' Late bound on purpose: ActiveSheet is a Worksheet here and a Workbook
+        ' above, and both carry ExportAsFixedFormat with the same arguments.
+        Set source = wb.ActiveSheet
+    End If
+
+    source.ExportAsFixedFormat _
+        Type:=xlTypePDF, fileName:=outPath, Quality:=xlQualityStandard, _
+        IncludeDocProperties:=True, IgnorePrintAreas:=False, OpenAfterPublish:=False
+    If Err.Number <> 0 Then
+        WritePdf = "PROBLEM: " & PdfErrorText(Err.Number, Err.Description) & " "
+        Err.Clear
+        Exit Function
+    End If
+
+    On Error GoTo 0
+
+    ' Excel can report success on an export that produced no file at all, so
+    ' the result is checked rather than assumed. Same reason the header and
+    ' footer writes are read back.
+    If Not FileExists(outPath) Then
+        WritePdf = "PROBLEM: Excel reported success but no file appeared at " & outPath & ". "
+    End If
+End Function
+
+
+' Deletes an existing PDF so the export can write in its place, clearing the
+' read-only attribute if it has one. Returns "" when the path is free.
+Private Function ClearTarget(ByVal outPath As String) As String
+    Dim f As Object
+
+    If Not FileExists(outPath) Then Exit Function
+
+    On Error Resume Next
+    Set f = Fso.GetFile(outPath)
+    If (f.Attributes And 1) = 1 Then f.Attributes = f.Attributes - 1
+    f.Delete True
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+
+    If FileExists(outPath) Then
+        ClearTarget = "PROBLEM: the PDF already there could not be replaced. It is " & _
+                      "open in a viewer, locked by the Explorer preview pane, or " & _
+                      "read only: " & outPath & " "
+    End If
+End Function
+
+
+' True when the wanted sheets are simply everything visible in the workbook,
+' charts included, in which case the workbook can be exported as it stands.
+Private Function CoversAllVisible(ByVal wb As Workbook, ByVal wanted As Collection) As Boolean
+    Dim sh As Object
+    Dim shown As Long
+
+    For Each sh In wb.Sheets
+        If sh.Visible = xlSheetVisible Then shown = shown + 1
+    Next sh
+
+    CoversAllVisible = (shown = wanted.Count)
+End Function
+
+
+' The errors this actually throws in practice, said in English.
+Private Function PdfErrorText(ByVal errNo As Long, ByVal errText As String) As String
+    Select Case errNo
+        Case -2147018887          ' 0x80071779, Win32 6009: the file is read only
+            PdfErrorText = "Excel would not write the PDF because a read only file " & _
+                           "is in the way, or the destination folder is read only."
+        Case 1004, 70
+            PdfErrorText = "could not write the PDF (error " & errNo & "). It is " & _
+                           "usually open in a PDF reader, or the folder is read only."
+        Case Else
+            PdfErrorText = "error " & errNo & " - " & errText & "."
+    End Select
+End Function
+
+
+' ===========================================================================
+' Revision description
+' ===========================================================================
+
+' The Description on the revision table row for `rev`, which the refresh
+' passes as the latest revision. Read straight from RevisionTable, so it
+' needs no Metadata row and works on every schedule as it stands. The last
+' matching row wins, in case a revision was ever entered twice. `found` says
+' whether the row was there at all, so a blank description can be told apart
+' from a revision the table does not hold.
+Public Function RevisionDescription(ByVal wb As Workbook, ByVal rev As String, _
+                                    Optional ByRef found As Boolean) As String
+    Dim wsRev As Worksheet
+    Dim lo As ListObject
+    Dim body As Range
+    Dim cRev As Long, cDesc As Long, r As Long
+
+    found = False
+    If Len(rev) = 0 Then Exit Function
+
+    Set wsRev = GetSheet(wb, SH_REV)
+    If wsRev Is Nothing Then Exit Function
+
+    On Error Resume Next
+    Set lo = wsRev.ListObjects("RevisionTable")
+    On Error GoTo 0
+    If lo Is Nothing Then Exit Function
+
+    Set body = lo.DataBodyRange
+    If body Is Nothing Then Exit Function
+
+    cRev = ColumnIndexByName(lo, "Revision")
+    cDesc = ColumnIndexByName(lo, "Description")
+    If cRev = 0 Or cDesc = 0 Then Exit Function
+
+    For r = body.Rows.Count To 1 Step -1
+        If StrComp(AsText(CellValue(body.Cells(r, cRev))), rev, vbTextCompare) = 0 Then
+            found = True
+            RevisionDescription = AsText(CellValue(body.Cells(r, cDesc)))
+            Exit Function
+        End If
+    Next r
+End Function
+
+
+' ===========================================================================
+' Security classification
+'
+' The marking (OFFICIAL, OFFICIAL-SENSITIVE, CONFIDENTIAL ...) normally sits
+' in the headers and footers, and sometimes in a cell of its own on the
+' cover. ClassificationOf reads it for ScheduleList, which is how a stray
+' CONFIDENTIAL footer gets noticed; SetClassificationIn changes it in place.
+'
+' Header and footer sections are numbered 1 to 18 here: 1-6 the ordinary
+' left/centre/right header then footer, 7-12 the same for a different first
+' page, 13-18 for even pages. The last two sets only count when that option
+' is switched on for the sheet.
+' ===========================================================================
+
+' What a schedule is marked as: "None", one marking, or "A + B" when its
+' sheets disagree. `gaps` names any printed sheet that carries no marking
+' while others do, which is how a missing footer shows up.
+Public Function ClassificationOf(ByVal wb As Workbook, ByRef gaps As String) As String
+    Dim hfRe As Object, cellRe As Object
+    Dim all As Object, one As Object
+    Dim ws As Worksheet
+    Dim bare As String
+    Dim k As Variant
+
+    Set hfRe = MarkingRegex()
+    Set cellRe = WholeCellRegex()
+    Set all = CreateObject("Scripting.Dictionary")
+    gaps = ""
+
+    For Each ws In wb.Worksheets
+        If IsPrintedSheet(ws) Then
+            Set one = CreateObject("Scripting.Dictionary")
+            SheetMarkings ws, hfRe, cellRe, one
+            If one.Count = 0 Then
+                If Len(bare) > 0 Then bare = bare & ", "
+                bare = bare & ws.Name
+            Else
+                For Each k In one.Keys
+                    all(k) = True
+                Next k
+            End If
+        End If
+    Next ws
+
+    If all.Count = 0 Then
+        ClassificationOf = "None"
+        Exit Function
+    End If
+
+    If Len(bare) > 0 Then gaps = "No security marking on " & bare & ". "
+    ClassificationOf = SortedKeys(all, " + ")
+End Function
+
+
+' True for a value the Setup sheet may hold as a classification.
+Public Function IsKnownMarking(ByVal s As String) As Boolean
+    IsKnownMarking = WholeCellRegex().Test(s)
+End Function
+
+
+' "Official sensitive" -> "OFFICIAL-SENSITIVE": one spelling for comparing.
+Public Function NormaliseMarking(ByVal m As String) As String
+    m = UCase$(Trim$(m))
+    Do While InStr(m, "  ") > 0
+        m = Replace(m, "  ", " ")
+    Loop
+    If m = "OFFICIAL SENSITIVE" Then m = "OFFICIAL-SENSITIVE"
+    NormaliseMarking = m
+End Function
+
+
+' Changes the marking on every printed sheet to `wanted`, or takes it off
+' when `wanted` is "". Returns the log; `changed` counts what was written, so
+' the caller can leave a workbook that was already right unsaved.
+'
+' A marking that is already there, in a header, a footer or a cell of its
+' own, is replaced where it stands, keeping its font, size and colour. A sheet
+' with none gets one in the centre of its footer, and of its header too when
+' that is empty. Nothing else in a header or footer is touched, and neither
+' are orientation, margins or the logo.
+'
+' Then the workbook is read back, the way the header and footer copy checks
+' itself, and anything other than `wanted` everywhere is a PROBLEM.
+Public Function SetClassificationIn(ByVal wb As Workbook, ByVal wanted As String, _
+                                    ByRef changed As Long) As String
+    Dim hfRe As Object, cellRe As Object
+    Dim ws As Worksheet
+    Dim ps As PageSetup
+    Dim had As Object
+    Dim cell As Range
+    Dim i As Long
+    Dim before As String, after As String
+    Dim log As String, added As String, cellsDone As String, formulas As String
+    Dim gaps As String, nowReads As String, expected As String
+    Dim where As String
+
+    Set hfRe = MarkingRegex()
+    Set cellRe = WholeCellRegex()
+    changed = 0
+    If Len(wanted) > 0 Then wanted = NormaliseMarking(wanted)
+    expected = IIf(Len(wanted) = 0, "None", wanted)
+
+    On Error GoTo Failed
+
+    For Each ws In wb.Worksheets
+        If IsPrintedSheet(ws) Then
+            where = ws.Name
+            Set had = CreateObject("Scripting.Dictionary")
+            SheetMarkings ws, hfRe, cellRe, had
+            Set ps = ws.PageSetup
+
+            For i = 1 To 18
+                If SectionInUse(ps, i) Then
+                    before = HFSection(ps, i)
+                    If hfRe.Test(before) Then
+                        after = ReplaceMarking(hfRe, before, wanted)
+                        If StrComp(after, before, vbBinaryCompare) <> 0 Then
+                            SetHFSection ps, i, after
+                            changed = changed + 1
+                        End If
+                    End If
+                End If
+            Next i
+
+            For Each cell In MarkingArea(ws).Cells
+                If VarType(cell.Value) = vbString And Not IsDelrefRow(cell) Then
+                    If cellRe.Test(CStr(cell.Value)) Then
+                        If cell.HasFormula Then
+                            formulas = formulas & ws.Name & "!" & cell.Address(False, False) & " "
+                        ElseIf StrComp(Trim$(CStr(cell.Value)), wanted, vbBinaryCompare) <> 0 Then
+                            If Len(wanted) = 0 Then
+                                cell.ClearContents
+                            Else
+                                cell.Value = wanted
+                            End If
+                            changed = changed + 1
+                            cellsDone = cellsDone & ws.Name & "!" & cell.Address(False, False) & " "
+                        End If
+                    End If
+                End If
+            Next cell
+
+            If had.Count = 0 And Len(wanted) > 0 Then
+                ps.CenterFooter = AddMarking(ps.CenterFooter, wanted)
+                If Len(ps.CenterHeader) = 0 Then ps.CenterHeader = AddMarking("", wanted)
+                changed = changed + 1
+                If Len(added) > 0 Then added = added & ", "
+                added = added & ws.Name
+            End If
+        End If
+    Next ws
+
+    where = "reading it back"
+    If changed > 0 Then log = "Set to " & expected & " in " & changed & " place(s). "
+    If Len(added) > 0 Then log = log & "Added to the centre footer of " & added & ". "
+    If Len(cellsDone) > 0 Then log = log & "Cells changed: " & Trim$(cellsDone) & ". "
+
+    nowReads = ClassificationOf(wb, gaps)
+    If StrComp(nowReads, expected, vbTextCompare) <> 0 Then
+        log = log & "PROBLEM: reads back as " & nowReads & ", not " & expected & ". "
+        If Len(formulas) > 0 Then _
+            log = log & "These cells show a marking through a formula and were left alone: " & _
+                  Trim$(formulas) & ". "
+    ElseIf Len(wanted) > 0 And Len(gaps) > 0 Then
+        log = log & "PROBLEM: " & gaps
+    End If
+
+    SetClassificationIn = log
+    Exit Function
+
+Failed:
+    SetClassificationIn = log & "PROBLEM: '" & where & "' error " & Err.Number & " - " & _
+                          Err.Description & ". "
+End Function
+
+
+' A visible sheet that would print. Metadata never does.
+Private Function IsPrintedSheet(ByVal ws As Worksheet) As Boolean
+    If ws.Visible <> xlSheetVisible Then Exit Function
+    If LCase$(Trim$(ws.Name)) = LCase$(SH_META) Then Exit Function
+    IsPrintedSheet = HasSomethingToPrint(ws)
+End Function
+
+
+' Adds every marking on one sheet to `found`, normalised.
+Private Sub SheetMarkings(ByVal ws As Worksheet, ByVal hfRe As Object, ByVal cellRe As Object, _
+                          ByVal found As Object)
+    Dim ps As PageSetup
+    Dim ms As Object, m As Object
+    Dim cell As Range
+    Dim i As Long
+
+    On Error Resume Next
+    Set ps = ws.PageSetup
+    For i = 1 To 18
+        Set ms = Nothing
+        If SectionInUse(ps, i) Then
+            Set ms = hfRe.Execute(HFSection(ps, i))
+            If Not ms Is Nothing Then
+                For Each m In ms
+                    found(NormaliseMarking(CStr(m.SubMatches(1)))) = True
+                Next m
+            End If
+        End If
+    Next i
+
+    For Each cell In MarkingArea(ws).Cells
+        If VarType(cell.Value) = vbString And Not IsDelrefRow(cell) Then
+            Set ms = cellRe.Execute(CStr(cell.Value))
+            If ms.Count > 0 Then found(NormaliseMarking(CStr(ms(0).SubMatches(0)))) = True
+        End If
+    Next cell
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+
+' Where a marking typed into a cell is looked for: all of the cover and the
+' revision page, but only the printed title block of a schedule sheet, so a
+' word in the body of a long schedule is never taken for one. A cell counts
+' only when the marking is all it says.
+Private Function MarkingArea(ByVal ws As Worksheet) As Range
+    If IsCommonSheet(ws) Then
+        Set MarkingArea = ws.UsedRange
+    Else
+        Set MarkingArea = ws.Range(ws.Cells(1, 1), ws.Cells(TITLE_BLOCK_ROWS, TITLE_BLOCK_COLS))
+    End If
+End Function
+
+
+' The Revision Page row labelled "Delref Classification" holds a per-document
+' value that is not a security marking, whatever it says, so it is never read
+' as one or changed.
+Private Function IsDelrefRow(ByVal cell As Range) As Boolean
+    IsDelrefRow = (InStr(1, AsText(CellValue(cell.Worksheet.Cells(cell.Row, 1))), _
+                         "Delref", vbTextCompare) > 0)
+End Function
+
+
+' A marking anywhere in header or footer text. Group 1 is whatever sits just
+' before it: the start, a format code such as &B or a &K colour, or any
+' character that is not a letter. The format codes are the point: Excel
+' writes a bold banner as "&BOFFICIAL", and B is a letter. Group 2 is the
+' marking itself.
+Private Function MarkingRegex() As Object
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    re.pattern = "(^|&K[0-9A-Fa-f+\-]{6}|&[A-Za-z]|[^A-Za-z])(" & MARKINGS & ")(?![A-Za-z])"
+    Set MarkingRegex = re
+End Function
+
+
+' A cell, or a Setup value, that says nothing but a marking.
+Private Function WholeCellRegex() As Object
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+    re.pattern = "^\s*(" & MARKINGS & ")\s*$"
+    Set WholeCellRegex = re
+End Function
+
+
+Private Function ReplaceMarking(ByVal re As Object, ByVal txt As String, _
+                                ByVal wanted As String) As String
+    Dim out As String
+    out = re.Replace(txt, "$1" & wanted)
+    If Len(wanted) = 0 Then out = TidySection(out)
+    ReplaceMarking = out
+End Function
+
+
+' What is left of a section once a marking is taken out: blank when only
+' formatting codes and line breaks remain, so an empty banner does not keep
+' its font settings behind, otherwise the text without doubled-up breaks.
+Private Function TidySection(ByVal s As String) As String
+    Dim bare As String
+
+    Do While InStr(s, vbLf & vbLf) > 0
+        s = Replace(s, vbLf & vbLf, vbLf)
+    Loop
+    Do While Left$(s, 1) = vbLf
+        s = Mid$(s, 2)
+    Loop
+    Do While Right$(s, 1) = vbLf
+        s = Left$(s, Len(s) - 1)
+    Loop
+
+    bare = RegexReplace(s, "&""[^""]*""|&K[0-9A-Fa-f+\-]{6}|&\d+|&[BIUESXY]", "")
+    bare = Replace(Replace(bare, vbLf, ""), vbCr, "")
+    If Len(Trim$(bare)) = 0 Then s = ""
+
+    TidySection = s
+End Function
+
+
+' A bold marking, on a line of its own above whatever the section held.
+Private Function AddMarking(ByVal existing As String, ByVal wanted As String) As String
+    AddMarking = "&B" & wanted & "&B"
+    If Len(existing) > 0 Then AddMarking = AddMarking & vbLf & existing
+End Function
+
+
+Private Function SectionInUse(ByVal ps As PageSetup, ByVal i As Long) As Boolean
+    If i <= 6 Then
+        SectionInUse = True
+    ElseIf i <= 12 Then
+        SectionInUse = ps.DifferentFirstPageHeaderFooter
+    Else
+        SectionInUse = ps.OddAndEvenPagesHeaderFooter
+    End If
+End Function
+
+
+Private Function HFSection(ByVal ps As PageSetup, ByVal i As Long) As String
+    Select Case i
+        Case 1: HFSection = ps.LeftHeader
+        Case 2: HFSection = ps.CenterHeader
+        Case 3: HFSection = ps.RightHeader
+        Case 4: HFSection = ps.LeftFooter
+        Case 5: HFSection = ps.CenterFooter
+        Case 6: HFSection = ps.RightFooter
+        Case 7: HFSection = ps.FirstPage.LeftHeader.Text
+        Case 8: HFSection = ps.FirstPage.CenterHeader.Text
+        Case 9: HFSection = ps.FirstPage.RightHeader.Text
+        Case 10: HFSection = ps.FirstPage.LeftFooter.Text
+        Case 11: HFSection = ps.FirstPage.CenterFooter.Text
+        Case 12: HFSection = ps.FirstPage.RightFooter.Text
+        Case 13: HFSection = ps.EvenPage.LeftHeader.Text
+        Case 14: HFSection = ps.EvenPage.CenterHeader.Text
+        Case 15: HFSection = ps.EvenPage.RightHeader.Text
+        Case 16: HFSection = ps.EvenPage.LeftFooter.Text
+        Case 17: HFSection = ps.EvenPage.CenterFooter.Text
+        Case 18: HFSection = ps.EvenPage.RightFooter.Text
+    End Select
+End Function
+
+
+Private Sub SetHFSection(ByVal ps As PageSetup, ByVal i As Long, ByVal txt As String)
+    Select Case i
+        Case 1: ps.LeftHeader = txt
+        Case 2: ps.CenterHeader = txt
+        Case 3: ps.RightHeader = txt
+        Case 4: ps.LeftFooter = txt
+        Case 5: ps.CenterFooter = txt
+        Case 6: ps.RightFooter = txt
+        Case 7: ps.FirstPage.LeftHeader.Text = txt
+        Case 8: ps.FirstPage.CenterHeader.Text = txt
+        Case 9: ps.FirstPage.RightHeader.Text = txt
+        Case 10: ps.FirstPage.LeftFooter.Text = txt
+        Case 11: ps.FirstPage.CenterFooter.Text = txt
+        Case 12: ps.FirstPage.RightFooter.Text = txt
+        Case 13: ps.EvenPage.LeftHeader.Text = txt
+        Case 14: ps.EvenPage.CenterHeader.Text = txt
+        Case 15: ps.EvenPage.RightHeader.Text = txt
+        Case 16: ps.EvenPage.LeftFooter.Text = txt
+        Case 17: ps.EvenPage.CenterFooter.Text = txt
+        Case 18: ps.EvenPage.RightFooter.Text = txt
+    End Select
+End Sub
+
+
+' A dictionary's keys in alphabetical order, joined. Two schedules marked the
+' same two ways then read the same, whichever sheet came first.
+Private Function SortedKeys(ByVal d As Object, ByVal sep As String) As String
+    Dim ks() As String
+    Dim k As Variant
+    Dim i As Long, j As Long, n As Long
+    Dim t As String
+
+    If d.Count = 0 Then Exit Function
+    ReDim ks(1 To d.Count)
+    For Each k In d.Keys
+        n = n + 1
+        ks(n) = CStr(k)
+    Next k
+
+    For i = 1 To n - 1
+        For j = i + 1 To n
+            If StrComp(ks(j), ks(i), vbTextCompare) < 0 Then
+                t = ks(i): ks(i) = ks(j): ks(j) = t
+            End If
+        Next j
+    Next i
+
+    For i = 1 To n
+        If i > 1 Then SortedKeys = SortedKeys & sep
+        SortedKeys = SortedKeys & ks(i)
+    Next i
+End Function
+
+
+' ===========================================================================
+' Title block on the schedule sheet
+'
+' Draws the block at the top of every schedule sheet so nobody merges cells
+' by hand:
+'
+'     | SCHEDULE OF ...  | DOCUMENTS REFERENCE: ...  |                     |
+'     | CLIENT: ...      | PURPOSE OF DOCUMENT: ...  | REVISION: ...       |
+'     | PROJECT: ...     | PROJECT NUMBER: ...       | REVISION DATE: ...  |
+'     | PREPARED BY: ... | CHECKED BY: ...           | APPROVED BY: ...    |
+'
+'     | General Notes: ... merged across the full width                   |
+'
+' Every value is a live formula on the local Metadata sheet, as before.
+'
+' The block spans the schedule's own columns: the print area if one is set,
+' otherwise the rightmost column with anything in it below the block. Where
+' the three groups split is kept from the existing block when the columns
+' still fit it, so a schedule does not change shape every time it is
+' repaired. Otherwise the splits are worked out from the column widths and
+' how long each group's text is.
+'
+' A schedule with no block gets one: 12 rows are inserted above it, for the
+' block, a gap, an empty General Notes box and a gap. Formulas, the print
+' area and the print titles below move down with them, as Excel does for any
+' inserted row.
+'
+' Never guesses at something it does not recognise. Rows 1 to 4 holding text
+' that is neither a title block label nor the schedule title, or title block
+' labels anywhere other than rows 1 to 4, leave the sheet as it is with a
+' PROBLEM saying why.
+' ===========================================================================
+
+' Every visible schedule sheet in the workbook. `changed` counts sheets
+' actually changed, so a workbook already right is not saved.
+Public Function BuildTitleBlocks(ByVal wb As Workbook, ByRef changed As Long) As String
+    Dim ws As Worksheet, wsMeta As Worksheet
+    Dim log As String
+    Dim n As Long
+
+    changed = 0
+    Set wsMeta = GetSheet(wb, SH_META)
+    If wsMeta Is Nothing Then
+        BuildTitleBlocks = "PROBLEM: no Metadata sheet, so there is nothing for the title " & _
+                           "block to read. Run 'Set up / repair links' on it first. "
+        Exit Function
+    End If
+
+    For Each ws In wb.Worksheets
+        If Not IsCommonSheet(ws) And ws.Visible = xlSheetVisible Then
+            If HasSomethingToPrint(ws) Then
+                n = n + 1
+                log = log & BuildTitleBlock(ws, wsMeta, changed)
+            End If
+        End If
+    Next ws
+
+    If n = 0 Then log = "No schedule sheet with anything on it. "
+    BuildTitleBlocks = log
+End Function
+
+
+Private Function BuildTitleBlock(ByVal ws As Worksheet, ByVal wsMeta As Worksheet, _
+                                 ByRef changed As Long) As String
+    Dim who As String, stray As String, warn As String, log As String
+    Dim found As Long
+    Dim notesTop As Long, notesBot As Long
+    Dim lastCol As Long, edge As Long
+    Dim end1 As Long, end2 As Long
+    Dim bare As Boolean
+    Dim titleRows As String
+
+    who = "'" & ws.Name & "': "
+    On Error GoTo Failed
+
+    ' --- what is there now ------------------------------------------------
+    found = TitleLabelsIn(ws, wsMeta, 1, TB_ROWS, stray)
+    If found = 0 Then
+        If TitleLabelsIn(ws, wsMeta, 1, TITLE_BLOCK_ROWS + TB_INSERT, stray) > 0 Then
+            BuildTitleBlock = "PROBLEM: " & who & "has title block labels below row " & _
+                TB_ROWS & ", so its layout is not the standard one. Left alone. "
+            Exit Function
+        End If
+        bare = True
+    ElseIf Len(stray) > 0 Then
+        BuildTitleBlock = "PROBLEM: " & who & "rows 1-" & TB_ROWS & " hold something " & _
+            "that is not part of a title block (" & Left$(stray, 80) & "). Left alone. "
+        Exit Function
+    ElseIf found < 6 Then
+        BuildTitleBlock = "PROBLEM: " & who & "only " & found & " title block labels in " & _
+            "rows 1-" & TB_ROWS & ", too few to be sure it is one. Left alone. "
+        Exit Function
+    End If
+
+    ' --- a bare schedule gets the rows to put it in -------------------------
+    If bare Then
+        ws.Rows("1:" & TB_INSERT).Insert Shift:=xlDown
+        ws.Rows("1:" & TB_INSERT).ClearFormats
+        notesTop = TB_NOTES_TOP
+        notesBot = TB_NOTES_TOP + TB_NOTES_ROWS - 1
+        With ws.Cells(notesTop, 1)
+            .Value = "General Notes:" & vbLf & "[1] "
+            .Font.Name = TB_FONT
+            .Font.Size = TB_SIZE
+        End With
+        ws.Range(ws.Rows(TB_ROWS + 1), ws.Rows(TB_INSERT)).RowHeight = TB_ROW_H
+        log = log & "Added a title block and an empty General Notes box above the " & _
+                    "schedule (" & TB_INSERT & " rows inserted). "
+        changed = changed + 1
+    Else
+        FindNotes ws, notesTop, notesBot
+    End If
+
+    ' --- how wide, and where the groups split -------------------------------
+    lastCol = TableRightEdge(ws, IIf(notesBot > 0, notesBot + 1, TB_ROWS + 1))
+    If lastCol < 3 Then
+        BuildTitleBlock = log & "PROBLEM: " & who & "the schedule is fewer than 3 columns " & _
+                          "wide, too narrow for the title block. "
+        Exit Function
+    End If
+
+    edge = OldBlockEdge(ws, notesTop, notesBot)
+    If edge < lastCol Then edge = lastCol
+
+    If Not ExistingSplits(ws, wsMeta, lastCol, end1, end2) Then
+        PlanSplits ws, wsMeta, lastCol, end1, end2
+    End If
+    warn = FitWarning(ws, wsMeta, lastCol, end1, end2)
+
+    ' --- write it, unless it is already exactly this -----------------------
+    If bare Or Not BlockIsCurrent(ws, wsMeta, lastCol, end1, end2, notesTop, notesBot) Then
+        WriteBlock ws, wsMeta, edge, lastCol, end1, end2
+        If notesTop > 0 Then WriteNotesBox ws, notesTop, notesBot, edge, lastCol
+        If Not bare Then
+            log = log & "Title block redrawn across columns A-" & ColLetter(lastCol) & "" & _
+                        IIf(notesTop > 0, ", notes box with it", "") & ". "
+            changed = changed + 1
+        End If
+    End If
+
+    If notesTop = 0 Then
+        log = log & "No General Notes box found under the block, so none was widened " & _
+                    "(the tool only adds one to a schedule that has no title block). "
+    Else
+        log = log & NotesToTemplateSize(ws, notesTop, notesBot, changed)
+    End If
+
+    ' --- every page carries the block and the notes ------------------------
+    titleRows = WantedTitleRows(ws, IIf(notesBot > 0, notesBot, TB_ROWS))
+    If StrComp(Replace(ws.PageSetup.PrintTitleRows, "$", ""), _
+               Replace(titleRows, "$", ""), vbTextCompare) <> 0 Then
+        ws.PageSetup.PrintTitleRows = titleRows
+        log = log & "Print titles set to rows " & Replace(Replace(titleRows, "$", ""), ":", "-") & _
+                    ", so the block and notes repeat on every page. "
+        changed = changed + 1
+    End If
+    If bare Then
+        log = log & "Check the print titles also take in the schedule's own column " & _
+                    "headings, under Page Layout > Print Titles. "
+    End If
+
+    If Not HasPageNumber(ws.PageSetup) Then
+        If Len(ws.PageSetup.RightFooter) = 0 Then
+            ws.PageSetup.RightFooter = "Page &P of &N"
+            log = log & "Added 'Page X of Y' to the right footer. "
+            changed = changed + 1
+        Else
+            log = log & "No page number, and the right footer is already in use, so " & _
+                        "none was added. "
+        End If
+    End If
+
+    If Len(warn) > 0 Then log = log & warn
+    If Len(log) > 0 Then log = who & log
+    BuildTitleBlock = log
+    Exit Function
+
+Failed:
+    BuildTitleBlock = log & "PROBLEM: " & who & "error " & Err.Number & " - " & _
+                      Err.Description & " (is the sheet protected?). "
+End Function
+
+
+' The text of each block cell, row r (1-4) and group g (1-3). `metaRow` 0
+' means the cell is left empty.
+Private Sub BlockField(ByVal r As Long, ByVal g As Long, ByRef canonical As String, _
+                       ByRef metaRow As Long, ByRef asDate As Boolean)
+    canonical = "": metaRow = 0: asDate = False
+    Select Case r * 10 + g
+        Case 11: metaRow = 3                       ' the schedule title, no label
+        Case 12: canonical = "DOCUMENTS REFERENCE": metaRow = 2
+        Case 21: canonical = "CLIENT": metaRow = 6
+        Case 22: canonical = "PURPOSE OF DOCUMENT": metaRow = 13
+        Case 23: canonical = "REVISION": metaRow = 8
+        Case 31: canonical = "PROJECT": metaRow = 4
+        Case 32: canonical = "PROJECT NUMBER": metaRow = 5
+        Case 33: canonical = "REVISION DATE": metaRow = 9: asDate = True
+        Case 41: canonical = "PREPARED BY": metaRow = 10
+        Case 42: canonical = "CHECKED BY": metaRow = 11
+        Case 43: canonical = "APPROVED BY": metaRow = 12
+    End Select
+End Sub
+
+
+Private Function BlockFormula(ByVal wsMeta As Worksheet, ByVal r As Long, ByVal g As Long) As String
+    Dim canonical As String, metaRow As Long, asDate As Boolean
+    BlockField r, g, canonical, metaRow, asDate
+    If metaRow = 0 Then Exit Function
+    If Len(canonical) = 0 Then
+        BlockFormula = "=" & SheetRef(wsMeta.Name) & "!B" & metaRow
+    Else
+        BlockFormula = TitleBlockFormula(wsMeta, canonical, metaRow, asDate)
+    End If
+End Function
+
+
+' What the cell will read, for working out widths.
+Private Function BlockText(ByVal wsMeta As Worksheet, ByVal r As Long, ByVal g As Long) As String
+    Dim canonical As String, metaRow As Long, asDate As Boolean
+    BlockField r, g, canonical, metaRow, asDate
+    If metaRow = 0 Then Exit Function
+    BlockText = AsText(CellValue(wsMeta.Cells(metaRow, 2)))
+    If Len(canonical) > 0 Then BlockText = canonical & ": " & BlockText
+End Function
+
+
+' Title block labels among the cells of rows r1 to r2. `stray` collects any
+' other text in those rows that is not the schedule title.
+Private Function TitleLabelsIn(ByVal ws As Worksheet, ByVal wsMeta As Worksheet, _
+                               ByVal r1 As Long, ByVal r2 As Long, ByRef stray As String) As Long
+    Dim r As Long, c As Long
+    Dim cell As Range
+    Dim v As String, f As String
+    Dim metaRow As Long, asDate As Boolean
+    Dim title As String
+
+    stray = ""
+    title = AsText(CellValue(wsMeta.Range("B3")))
+
+    For r = r1 To r2
+        For c = 1 To TITLE_BLOCK_COLS
+            Set cell = ws.Cells(r, c)
+            If cell.Address = cell.MergeArea.Cells(1, 1).Address Then
+                v = AsText(CellValue(cell))
+                If Len(v) > 0 Then
+                    metaRow = 0
+                    If InStr(v, ":") > 0 Then TitleBlockField LabelKey(v), metaRow, asDate
+                    If metaRow > 0 Then
+                        TitleLabelsIn = TitleLabelsIn + 1
+                    Else
+                        f = CellFormula(cell)
+                        If StrComp(v, title, vbTextCompare) = 0 _
+                           Or StrComp(Left$(v, 11), "SCHEDULE OF", vbTextCompare) = 0 _
+                           Or InStr(1, Replace(f, "'", ""), SH_META & "!B3", vbTextCompare) > 0 Then
+                            ' the schedule title
+                        Else
+                            stray = stray & v & "; "
+                        End If
+                    End If
+                End If
+            End If
+        Next c
+    Next r
+End Function
+
+
+' The General Notes box under the block: a cell in column A, in the few rows
+' after the block, whose text starts "General Notes" or "Notes". Only a merged
+' box counts; notes typed down separate rows are left as they are.
+Private Sub FindNotes(ByVal ws As Worksheet, ByRef notesTop As Long, ByRef notesBot As Long)
+    Dim r As Long
+    Dim v As String
+    Dim area As Range
+
+    notesTop = 0: notesBot = 0
+    For r = TB_ROWS + 1 To TB_ROWS + 4
+        v = UCase$(Trim$(AsText(CellValue(ws.Cells(r, 1)))))
+        If Left$(v, 13) = "GENERAL NOTES" Or Left$(v, 5) = "NOTES" Then
+            Set area = ws.Cells(r, 1).MergeArea
+            If area.Cells.Count > 1 Then
+                notesTop = area.Row
+                notesBot = area.Row + area.Rows.Count - 1
+            End If
+            Exit Sub
+        End If
+    Next r
+End Sub
+
+
+' The last column of the schedule itself: the print area's if one is set,
+' otherwise the rightmost column with anything in it from `fromRow` down.
+Private Function TableRightEdge(ByVal ws As Worksheet, ByVal fromRow As Long) As Long
+    Dim pa As String
+    Dim area As Range
+    Dim ur As Range
+    Dim lastRow As Long, c As Long
+
+    On Error Resume Next
+    pa = ws.PageSetup.PrintArea
+    On Error GoTo 0
+    If Len(pa) > 0 Then
+        For Each area In ws.Range(pa).Areas
+            If area.Column + area.Columns.Count - 1 > TableRightEdge Then _
+                TableRightEdge = area.Column + area.Columns.Count - 1
+        Next area
+        Exit Function
+    End If
+
+    Set ur = ws.UsedRange
+    lastRow = ur.Row + ur.Rows.Count - 1
+    If fromRow > lastRow Then Exit Function
+
+    For c = ur.Column + ur.Columns.Count - 1 To 1 Step -1
+        If Application.WorksheetFunction.CountA( _
+               ws.Range(ws.Cells(fromRow, c), ws.Cells(lastRow, c))) > 0 Then
+            TableRightEdge = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+' How far right the current block and notes box reach, so a block that is
+' getting narrower has its old right-hand part cleared too.
+Private Function OldBlockEdge(ByVal ws As Worksheet, ByVal notesTop As Long, _
+                              ByVal notesBot As Long) As Long
+    Dim r As Long, c As Long, lastR As Long
+    Dim cell As Range
+    Dim reach As Long
+
+    lastR = TB_ROWS
+    If notesTop > 0 Then lastR = notesBot
+    For r = 1 To lastR
+        For c = 1 To TITLE_BLOCK_COLS
+            Set cell = ws.Cells(r, c)
+            reach = 0
+            If cell.MergeCells Then reach = cell.MergeArea.Column + cell.MergeArea.Columns.Count - 1
+            If Len(AsText(CellValue(cell))) > 0 And c > reach Then reach = c
+            If reach > OldBlockEdge Then OldBlockEdge = reach
+        Next c
+    Next r
+End Function
+
+
+' The splits the block already has, taken from row 2. Kept when the block
+' still spans exactly the schedule's columns and its text fits, so a repair
+' does not reshape a block somebody has already got looking right.
+Private Function ExistingSplits(ByVal ws As Worksheet, ByVal wsMeta As Worksheet, _
+                                ByVal lastCol As Long, ByRef end1 As Long, _
+                                ByRef end2 As Long) As Boolean
+    Dim a As Range, b As Range, c As Range
+
+    On Error GoTo Nope
+    Set a = ws.Cells(2, 1).MergeArea
+    end1 = a.Column + a.Columns.Count - 1
+    If end1 >= lastCol - 1 Then GoTo Nope
+    Set b = ws.Cells(2, end1 + 1).MergeArea
+    end2 = b.Column + b.Columns.Count - 1
+    If end2 >= lastCol Then GoTo Nope
+    Set c = ws.Cells(2, end2 + 1).MergeArea
+    If c.Column + c.Columns.Count - 1 <> lastCol Then GoTo Nope
+
+    ExistingSplits = (Len(FitWarning(ws, wsMeta, lastCol, end1, end2)) = 0)
+    Exit Function
+
+Nope:
+    end1 = 0: end2 = 0
+End Function
+
+
+' New splits: the columns divided so each group gets a share of the width in
+' proportion to its longest line of text, and never fewer than one column.
+Private Sub PlanSplits(ByVal ws As Worksheet, ByVal wsMeta As Worksheet, _
+                       ByVal lastCol As Long, ByRef end1 As Long, ByRef end2 As Long)
+    Dim need(1 To 3) As Double
+    Dim cum() As Double
+    Dim total As Double, t1 As Double, t2 As Double, best As Double
+    Dim c As Long
+
+    GroupNeeds wsMeta, need
+    ReDim cum(0 To lastCol)
+    For c = 1 To lastCol
+        cum(c) = cum(c - 1) + ColWidth(ws, c)
+    Next c
+    total = need(1) + need(2) + need(3)
+    t1 = cum(lastCol) * need(1) / total
+    t2 = cum(lastCol) * (need(1) + need(2)) / total
+
+    end1 = 1
+    best = Abs(cum(1) - t1)
+    For c = 2 To lastCol - 2
+        If Abs(cum(c) - t1) < best Then best = Abs(cum(c) - t1): end1 = c
+    Next c
+
+    end2 = end1 + 1
+    best = Abs(cum(end2) - t2)
+    For c = end1 + 2 To lastCol - 1
+        If Abs(cum(c) - t2) < best Then best = Abs(cum(c) - t2): end2 = c
+    Next c
+End Sub
+
+
+' A line for the log when a group is narrower than its text, or "".
+Private Function FitWarning(ByVal ws As Worksheet, ByVal wsMeta As Worksheet, _
+                            ByVal lastCol As Long, ByVal end1 As Long, _
+                            ByVal end2 As Long) As String
+    Dim need(1 To 3) As Double, have(1 To 3) As Double
+    Dim c As Long, g As Long
+    Dim tight As String
+
+    GroupNeeds wsMeta, need
+    For c = 1 To lastCol
+        If c <= end1 Then
+            g = 1
+        ElseIf c <= end2 Then
+            g = 2
+        Else
+            g = 3
+        End If
+        have(g) = have(g) + ColWidth(ws, c)
+    Next c
+
+    For g = 1 To 3
+        If have(g) < need(g) Then tight = tight & IIf(Len(tight) > 0, ", ", "") & Choose(g, "left", "middle", "right")
+    Next g
+    If Len(tight) > 0 Then
+        FitWarning = "The " & tight & " part of the title block may be too narrow for its " & _
+                     "text; check a print preview. "
+    End If
+End Function
+
+
+Private Sub GroupNeeds(ByVal wsMeta As Worksheet, ByRef need() As Double)
+    Dim r As Long, g As Long
+    Dim n As Double
+    For g = 1 To 3
+        need(g) = 0
+        For r = 1 To TB_ROWS
+            n = Len(BlockText(wsMeta, r, g)) * TB_CHAR_W + 2
+            If n > need(g) Then need(g) = n
+        Next r
+    Next g
+End Sub
+
+
+Private Function ColWidth(ByVal ws As Worksheet, ByVal c As Long) As Double
+    If ws.Columns(c).Hidden Then Exit Function
+    ColWidth = ws.Columns(c).ColumnWidth
+End Function
+
+
+' True when the block, notes box and their merges are already exactly what
+' would be written, styling included, so an untouched schedule is not saved
+' for nothing and one drawn in a different style is brought into line.
+Private Function BlockIsCurrent(ByVal ws As Worksheet, ByVal wsMeta As Worksheet, _
+                                ByVal lastCol As Long, ByVal end1 As Long, ByVal end2 As Long, _
+                                ByVal notesTop As Long, ByVal notesBot As Long) As Boolean
+    Dim r As Long, g As Long
+    Dim c1 As Long, c2 As Long
+    Dim want As Range
+
+    On Error GoTo Nope
+    For r = 1 To TB_ROWS
+        For g = 1 To 3
+            GroupCols g, lastCol, end1, end2, c1, c2
+            Set want = ws.Range(ws.Cells(r, c1), ws.Cells(r, c2))
+            If ws.Cells(r, c1).MergeArea.Address <> want.Address Then GoTo Nope
+            If StrComp(Replace(CellFormula(ws.Cells(r, c1)), "'", ""), _
+                       Replace(BlockFormula(wsMeta, r, g), "'", ""), vbTextCompare) <> 0 Then GoTo Nope
+            With ws.Cells(r, c1)
+                If .Font.Name <> TB_FONT Or .Font.Size <> TB_SIZE Then GoTo Nope
+                If .HorizontalAlignment <> xlCenter Then GoTo Nope
+                If .Interior.ColorIndex <> xlColorIndexNone Then GoTo Nope
+            End With
+        Next g
+    Next r
+    If notesTop > 0 Then
+        Set want = ws.Range(ws.Cells(notesTop, 1), ws.Cells(notesBot, lastCol))
+        If ws.Cells(notesTop, 1).MergeArea.Address <> want.Address Then GoTo Nope
+    End If
+    BlockIsCurrent = True
+Nope:
+End Function
+
+
+Private Sub GroupCols(ByVal g As Long, ByVal lastCol As Long, ByVal end1 As Long, _
+                      ByVal end2 As Long, ByRef c1 As Long, ByRef c2 As Long)
+    Select Case g
+        Case 1: c1 = 1: c2 = end1
+        Case 2: c1 = end1 + 1: c2 = end2
+        Case Else: c1 = end2 + 1: c2 = lastCol
+    End Select
+End Sub
+
+
+' Rows 1-4 cleared out to `edge` and drawn again. Only title block cells are
+' ever here: anything else stopped the build before this point.
+Private Sub WriteBlock(ByVal ws As Worksheet, ByVal wsMeta As Worksheet, ByVal edge As Long, _
+                       ByVal lastCol As Long, ByVal end1 As Long, ByVal end2 As Long)
+    Dim r As Long, g As Long
+    Dim c1 As Long, c2 As Long
+    Dim rng As Range
+    Dim f As String
+
+    With ws.Range(ws.Cells(1, 1), ws.Cells(TB_ROWS, edge))
+        .UnMerge
+        .Clear
+    End With
+
+    For r = 1 To TB_ROWS
+        For g = 1 To 3
+            GroupCols g, lastCol, end1, end2, c1, c2
+            Set rng = ws.Range(ws.Cells(r, c1), ws.Cells(r, c2))
+            If rng.Cells.Count > 1 Then rng.Merge
+            f = BlockFormula(wsMeta, r, g)
+            If Len(f) > 0 Then PutFormula rng.Cells(1, 1), f
+
+            With rng
+                .Font.Name = TB_FONT
+                .Font.Size = TB_SIZE
+                .Font.Bold = False
+                .HorizontalAlignment = xlCenter
+                .VerticalAlignment = xlCenter
+                .WrapText = False
+            End With
+            BoxBorder rng
+        Next g
+    Next r
+
+    ws.Rows(1).RowHeight = TB_TITLE_H
+    ws.Range(ws.Rows(2), ws.Rows(TB_ROWS)).RowHeight = TB_ROW_H
+End Sub
+
+
+' The notes box merged across the full width. Its text is not rewritten, so
+' any bold or line breaks in it survive: the old merge is undone (the text
+' stays in its top-left cell) and the new, wider one made around it.
+Private Sub WriteNotesBox(ByVal ws As Worksheet, ByVal notesTop As Long, ByVal notesBot As Long, _
+                          ByVal edge As Long, ByVal lastCol As Long)
+    Dim rng As Range
+
+    With ws.Range(ws.Cells(notesTop, 1), ws.Cells(notesBot, edge))
+        .UnMerge
+        .Borders.LineStyle = xlNone
+    End With
+
+    Set rng = ws.Range(ws.Cells(notesTop, 1), ws.Cells(notesBot, lastCol))
+    rng.Merge
+    With rng
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlTop
+        .WrapText = True
+    End With
+    BoxBorder rng
+End Sub
+
+
+Private Sub BoxBorder(ByVal rng As Range)
+    Dim side As Variant
+    For Each side In Array(xlEdgeLeft, xlEdgeTop, xlEdgeRight, xlEdgeBottom)
+        With rng.Borders(side)
+            .LineStyle = xlContinuous
+            .Weight = xlThin
+            .ColorIndex = xlColorIndexAutomatic
+        End With
+    Next side
+End Sub
+
+
+' Notes text back to the template's size, with its rows shrunk by the same
+' factor so the box still fits the text. Undoes a short-lived version of this
+' button that enlarged notes to counter print scaling: that grew the font and
+' the rows together, so shrinking both together puts them back as they were.
+' The text itself is not rewritten, so bold words stay bold.
+Private Function NotesToTemplateSize(ByVal ws As Worksheet, ByVal notesTop As Long, _
+                                     ByVal notesBot As Long, ByRef changed As Long) As String
+    Dim cur As Double, f As Double
+    Dim r As Long
+    Dim v As Variant
+
+    On Error Resume Next
+    v = ws.Cells(notesTop, 1).Font.Size
+    If IsNull(v) Then v = ws.Cells(notesTop, 1).Characters(1, 1).Font.Size
+    On Error GoTo 0
+    If Not IsNumeric(v) Then Exit Function
+    cur = CDbl(v)
+    If cur <= TB_SIZE + 0.2 Then Exit Function
+
+    f = TB_SIZE / cur
+    ws.Cells(notesTop, 1).Font.Size = TB_SIZE
+    For r = notesTop To notesBot
+        ws.Rows(r).RowHeight = ws.Rows(r).RowHeight * f
+    Next r
+    changed = changed + 1
+    NotesToTemplateSize = "Notes text back to " & TB_SIZE & "pt from " & cur & "pt, its box " & _
+                          "shrunk to match. "
+End Function
+
+
+' "$1:$n", where n is the end of the notes (or of the block), or further down
+' when the print titles already reached further, which is where a schedule's
+' own column headings are.
+Private Function WantedTitleRows(ByVal ws As Worksheet, ByVal minLast As Long) As String
+    Dim cur As String
+    Dim lastNow As Long
+    Dim p As Long
+
+    cur = Replace(ws.PageSetup.PrintTitleRows, "$", "")
+    p = InStrRev(cur, ":")
+    If p > 0 Then cur = Mid$(cur, p + 1)
+    If IsNumeric(cur) Then lastNow = CLng(cur)
+
+    If lastNow < minLast Then lastNow = minLast
+    WantedTitleRows = "$1:$" & lastNow
+End Function
+
+
+Private Function HasPageNumber(ByVal ps As PageSetup) As Boolean
+    Dim i As Long
+    For i = 1 To 6
+        If InStr(1, HFSection(ps, i), "&P", vbBinaryCompare) > 0 Then
+            HasPageNumber = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Private Function ColLetter(ByVal c As Long) As String
+    ColLetter = Split(Cells(1, c).Address(True, False), "$")(0)
+End Function
