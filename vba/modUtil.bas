@@ -40,13 +40,16 @@ Private mProgCaption As String
 ' per entry. This is where a release is recorded: add a line at the top and
 ' set TOOL_VERSION to match.
 '
-' InstallTool and every update write it to the Revision History table on the
-' README sheet, and Check for updates lists the entries a workbook is missing,
-' so nobody keeps a version table by hand. A | cannot appear in the text.
+' InstallTool and every update add any entry missing from the Revision History
+' table on the README sheet, keeping every line already there, and Check for
+' updates lists the entries a workbook is missing, so nobody keeps a version
+' table by hand. A | cannot appear in the text.
 ' ---------------------------------------------------------------------------
 Public Function ToolHistory() As Variant
     ToolHistory = Array( _
-        "1.2|27/11/2026|Overhaul of selection by X system and added updating function")
+        "1.2|27/11/2026|Overhaul of selection by X system and added updating function", _
+        "1.1|17/09/2026|Bugfix - new schedules wouldn't relink", _
+        "1.0|02/09/2026|First Release")
 End Function
 
 
