@@ -49,8 +49,8 @@ says whether anything has changed, and on a Yes:
 project details, options, project fields and suitability codes on Setup, the
 ScheduleList with its ticks and typed values, and the Log. The list is emptied
 only when an update changes its columns, and the next refresh fills it again.
-The **Revision History** table and the numbered instructions on the README
-sheet are rewritten from the new code, so it always matches what the workbook is running (see
+The **Revision History** table on the README sheet gets any version it is
+missing, and the numbered instructions are rewritten from the new code, so it always matches what the workbook is running (see
 [Releasing a version](#releasing-a-version)). The update box lists the versions
 on offer that the workbook does not have yet.
 
@@ -124,16 +124,22 @@ same line to [Version history](#version-history) below, and merge to `main`.
 From that, with nothing typed by hand in any workbook:
 
 - **Check for updates** lists the new line(s) in its box before installing
-- `InstallTool` and every update write the whole list to the **Revision
+- `InstallTool` and every update add any version missing from the **Revision
   History** table on the README sheet
 
-That table is the only place the workbook shows a version. The tool owns just
-that block: the cell reading `Revision History:` (`Version history` is
-recognised too, colon or not, and the heading is kept as written), the header
-row under it, and the rows down to the first empty one. When the table needs
-another row, only its own columns are pushed down. With no such heading it is
-added two rows under whatever is on the sheet, and a README sheet is made if
-there is none.
+The table only ever grows. Every line already in it stays exactly as typed,
+including any added by hand; versions from `ToolHistory` that are not in it
+yet are added; and the lines are put in version order, oldest at the top
+(`1.10` after `1.9`). When a formatted Excel table is full it gets another row;
+in plain cells, only the table's own columns are pushed down. A table that
+already lists every version is not touched at all.
+
+It is found by its heading, `Revision History:` (`Version history` is
+recognised too, colon or not), with its header row directly under it, and its
+columns by name: Version, Date, Description. With no such heading it is added
+two rows under whatever is on the sheet, and a README sheet is made if there
+is none. Opening the workbook also adds the current version if it is missing,
+in case an update did not get as far as the README sheet.
 
 ### The README sheet instructions
 
@@ -971,3 +977,5 @@ is left alone.
 | Version | Date | Changes |
 |---|---|---|
 | 1.2 | 27/11/2026 | Overhaul of selection by X system and added updating function |
+| 1.1 | 17/09/2026 | Bugfix - new schedules wouldn't relink |
+| 1.0 | 02/09/2026 | First Release |

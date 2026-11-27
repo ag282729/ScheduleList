@@ -189,29 +189,27 @@ End Sub
 ' ===========================================================================
 ' The Revision History table on the README sheet
 '
-' Written from ToolHistory in modUtil on every install and update, so each
-' workbook shows the history of the code it is running and nobody keeps a
-' version table by hand.
+' Kept in step with ToolHistory in modUtil on every install and update, so
+' nobody keeps a version table by hand. It only ever ADDS: every line already
+' in the table stays as it was typed, any version from ToolHistory that is
+' not in it yet is added, and the lot is put in version order, oldest at the
+' top. When the table is full it gets another row. A table that already has
+' every version is not touched at all.
 '
-' The tool owns only its own block: the cell reading "Revision History:" (or
-' "Version history", colon or not), the header row under it, and the rows
-' under that down to the first empty one, across the table's width. The
-' heading is kept as it is written. Nothing else on the sheet is touched.
-' With no such heading the block is added two rows under whatever is on the
-' sheet, and a README sheet is made if there is none.
+' The table is found by its heading, "Revision History:" ("Version history"
+' too, colon or not), with its header row directly under it. Either a
+' formatted Excel table (Insert > Table) or plain cells; a table keeps its
+' headers and style. With no such heading a plain one is added two rows
+' under whatever is on the sheet, and a README sheet is made if there is none.
 ' ===========================================================================
 Private Function WriteVersionHistory() As String
     Dim ws As Worksheet
     Dim head As Range
     Dim lo As ListObject
-    Dim r As Long, c As Long, w As Long, endRow As Long
-    Dim hist As Variant, parts As Variant
-    Dim i As Long, n As Long
+    Dim entries As Collection
+    Dim r As Long, c As Long, w As Long, endRow As Long, k As Long
 
     On Error GoTo Failed
-    hist = ToolHistory()
-    n = UBound(hist) - LBound(hist) + 1
-    w = 3
 
     Set ws = GetSheet(ThisWorkbook, SH_README)
     If ws Is Nothing Then Set ws = EnsureSheet(SH_README)
@@ -226,51 +224,138 @@ Private Function WriteVersionHistory() As String
         c = 1
         Set head = ws.Cells(r, c)
         head.Value = HISTORY_HEAD
-    Else
-        r = head.Row
-        c = head.Column
-
-        ' Drawn as an Excel table (Insert > Table)? Then it is filled the way a
-        ' table wants: its rows emptied and refilled, its headers and style
-        ' kept. Unmerging or inserting cells inside a table is refused by
-        ' Excel, which is what used to stop this part with nothing written.
-        Set lo = ws.Cells(r + 1, c).ListObject
-        If Not lo Is Nothing Then
-            WriteVersionHistory = FillHistoryTable(lo, hist)
-            head.Font.Bold = True
-            Exit Function
-        End If
-
-        ' The old table's width is its header row's, and at least three.
-        w = 0
-        Do While Len(AsText(CellValue(ws.Cells(r + 1, c + w)))) > 0 And w < 20
-            w = w + 1
-        Loop
-        If w < 3 Then w = 3
-
-        endRow = r
-        Do While Application.WorksheetFunction.CountA( _
-                     ws.Range(ws.Cells(endRow + 1, c), ws.Cells(endRow + 1, c + w - 1))) > 0
-            endRow = endRow + 1
-            If endRow > r + 500 Then Exit Do
-        Loop
-        If endRow > r Then
-            With ws.Range(ws.Cells(r + 1, c), ws.Cells(endRow, c + w - 1))
-                .UnMerge
-                .Clear
-            End With
-        End If
-
-        ' One more line each release. When the table needs more rows than it
-        ' had, only its own columns are pushed down, so whatever sits under it
-        ' moves with them and nothing beside it moves at all.
-        If r + 1 + n > endRow Then
-            ws.Range(ws.Cells(endRow + 1, c), ws.Cells(r + 1 + n, c + w - 1)).Insert _
-                Shift:=xlDown
-        End If
+        head.Font.Bold = True
+        Set entries = New Collection
+        AddMissingVersions entries
+        SortByVersion entries
+        WritePlainHistory ws, r, c, entries
+        Exit Function
     End If
 
-    head.Font.Bold = True
+    r = head.Row
+    c = head.Column
+
+    ' A formatted Excel table: Excel refuses unmerging or inserting cells
+    ' inside one, so it is filled the way tables want.
+    Set lo = ws.Cells(r + 1, c).ListObject
+    If Not lo Is Nothing Then
+        WriteVersionHistory = FillHistoryTable(lo)
+        Exit Function
+    End If
+
+    ' Plain cells. The table's width is its header row's, at least three, and
+    ' it runs down to the first row empty across that width.
+    w = 0
+    Do While Len(AsText(CellValue(ws.Cells(r + 1, c + w)))) > 0 And w < 20
+        w = w + 1
+    Loop
+    If w < 3 Then w = 3
+    endRow = r
+    Do While Application.WorksheetFunction.CountA( _
+                 ws.Range(ws.Cells(endRow + 1, c), ws.Cells(endRow + 1, c + w - 1))) > 0
+        endRow = endRow + 1
+        If endRow > r + 500 Then Exit Do
+    Loop
+
+    Set entries = New Collection
+    For k = r + 2 To endRow
+        If Len(AsText(CellValue(ws.Cells(k, c)))) > 0 Then
+            entries.Add Array(AsText(CellValue(ws.Cells(k, c))), _
+                              AsDateIfDayMonthYear(CellValue(ws.Cells(k, c + 1))), _
+                              AsText(CellValue(ws.Cells(k, c + 2))))
+        End If
+    Next k
+    If Not AddMissingVersions(entries) Then Exit Function      ' already complete
+
+    SortByVersion entries
+    If endRow > r Then
+        With ws.Range(ws.Cells(r + 1, c), ws.Cells(endRow, c + 2))
+            .UnMerge
+            .ClearContents
+        End With
+    End If
+    ' Another line needs another row: only these columns are pushed down, so
+    ' whatever is under the table moves with it and nothing beside it moves.
+    If endRow < r + 1 Then endRow = r + 1
+    If r + 1 + entries.Count > endRow Then
+        ws.Range(ws.Cells(endRow + 1, c), ws.Cells(r + 1 + entries.Count, c + 2)).Insert _
+            Shift:=xlDown
+    End If
+    WritePlainHistory ws, r, c, entries
+    Exit Function
+
+Failed:
+    WriteVersionHistory = "The Revision History table on the README sheet could not be " & _
+                          "written: error " & Err.Number & " - " & Err.Description & ". "
+End Function
+
+
+' The same for a formatted Excel table: its lines read by column name, the
+' missing versions added, then written back in order. Only the Version, Date
+' and Description columns are cleared and rewritten; any other column is left
+' alone. Rows are added only when the table is full.
+Private Function FillHistoryTable(ByVal lo As ListObject) As String
+    Dim cV As Long, cD As Long, cT As Long
+    Dim k As Long
+    Dim entries As Collection
+    Dim e As Variant
+    Dim rowRng As Range
+
+    On Error GoTo Failed
+    If lo.ListColumns.Count < 3 Then
+        FillHistoryTable = "The Revision History table on the README sheet has fewer than " & _
+                           "three columns, so it was left as it is. "
+        Exit Function
+    End If
+
+    cV = ColumnByName(lo, "Version")
+    cD = ColumnByName(lo, "Date")
+    cT = ColumnByName(lo, "Description")
+    If cT = 0 Then cT = ColumnByName(lo, "Changes")
+    If cV = 0 Then cV = 1
+    If cD = 0 Then cD = 2
+    If cT = 0 Then cT = 3
+
+    Set entries = New Collection
+    For k = 1 To lo.ListRows.Count
+        Set rowRng = lo.ListRows(k).Range
+        If Len(AsText(CellValue(rowRng.Cells(1, cV)))) > 0 Then
+            entries.Add Array(AsText(CellValue(rowRng.Cells(1, cV))), _
+                              AsDateIfDayMonthYear(CellValue(rowRng.Cells(1, cD))), _
+                              AsText(CellValue(rowRng.Cells(1, cT))))
+        End If
+    Next k
+    If Not AddMissingVersions(entries) Then Exit Function      ' already complete
+
+    SortByVersion entries
+    If Not lo.DataBodyRange Is Nothing Then
+        lo.ListColumns(cV).DataBodyRange.ClearContents
+        lo.ListColumns(cD).DataBodyRange.ClearContents
+        lo.ListColumns(cT).DataBodyRange.ClearContents
+    End If
+    Do While lo.ListRows.Count < entries.Count
+        lo.ListRows.Add
+    Loop
+
+    k = 0
+    For Each e In entries
+        k = k + 1
+        Set rowRng = lo.ListRows(k).Range
+        PutHistoryLine rowRng.Cells(1, cV), rowRng.Cells(1, cD), rowRng.Cells(1, cT), e
+    Next e
+    Exit Function
+
+Failed:
+    FillHistoryTable = "The Revision History table on the README sheet could not be " & _
+                       "written: error " & Err.Number & " - " & Err.Description & ". "
+End Function
+
+
+' Header row under the heading, then the lines, in plain cells.
+Private Sub WritePlainHistory(ByVal ws As Worksheet, ByVal r As Long, ByVal c As Long, _
+                              ByVal entries As Collection)
+    Dim e As Variant
+    Dim k As Long
 
     ws.Cells(r + 1, c).Value = "Version"
     ws.Cells(r + 1, c + 1).Value = "Date"
@@ -281,85 +366,114 @@ Private Function WriteVersionHistory() As String
         .Borders(xlEdgeBottom).LineStyle = xlContinuous
     End With
 
+    For Each e In entries
+        k = k + 1
+        PutHistoryLine ws.Cells(r + 1 + k, c), ws.Cells(r + 1 + k, c + 1), _
+                       ws.Cells(r + 1 + k, c + 2), e
+    Next e
+End Sub
+
+
+Private Sub PutHistoryLine(ByVal vCell As Range, ByVal dCell As Range, ByVal tCell As Range, _
+                           ByVal e As Variant)
+    With vCell
+        .NumberFormat = "@"              ' so 1.10 stays 1.10
+        .Value = e(0)
+        .HorizontalAlignment = xlLeft
+    End With
+    With dCell
+        .Value = e(1)
+        If VarType(e(1)) = vbDate Then .NumberFormat = "dd/mm/yyyy"
+        .HorizontalAlignment = xlLeft
+    End With
+    tCell.Value = e(2)
+End Sub
+
+
+' Adds each ToolHistory version not already among `entries`, as
+' Array(version, date, description). True when anything was added.
+Private Function AddMissingVersions(ByVal entries As Collection) As Boolean
+    Dim hist As Variant, parts As Variant
+    Dim i As Long
+    Dim e As Variant
+    Dim have As Boolean
+
+    hist = ToolHistory()
     For i = LBound(hist) To UBound(hist)
         parts = Split(CStr(hist(i)), "|", 3)
         If UBound(parts) = 2 Then
-            With ws.Cells(r + 2 + i - LBound(hist), c)
-                .NumberFormat = "@"          ' so 1.10 stays 1.10
-                .Value = Trim$(parts(0))
-                .HorizontalAlignment = xlLeft
-            End With
-            With ws.Cells(r + 2 + i - LBound(hist), c + 1)
-                .Value = DayMonthYear(Trim$(parts(1)))
-                .NumberFormat = "dd/mm/yyyy"
-                .HorizontalAlignment = xlLeft
-            End With
-            ws.Cells(r + 2 + i - LBound(hist), c + 2).Value = Trim$(parts(2))
+            have = False
+            For Each e In entries
+                If StrComp(CStr(e(0)), Trim$(parts(0)), vbTextCompare) = 0 Then
+                    have = True
+                    Exit For
+                End If
+            Next e
+            If Not have Then
+                entries.Add Array(Trim$(parts(0)), DayMonthYear(Trim$(parts(1))), Trim$(parts(2)))
+                AddMissingVersions = True
+            End If
         End If
     Next i
-    Exit Function
-
-Failed:
-    ' A protected README sheet, say. The install carries on, and says so.
-    WriteVersionHistory = "The Revision History table on the README sheet could not be " & _
-                          "written: error " & Err.Number & " - " & Err.Description & ". "
 End Function
 
 
-' The history written into an Excel table: every row emptied, then filled
-' newest first by column name (Version, Date, Description or Changes; the
-' first three columns when the names are something else). Rows are added
-' only when the table is too short; spare empty rows are left as they are.
-Private Function FillHistoryTable(ByVal lo As ListObject, ByVal hist As Variant) As String
-    Dim cV As Long, cD As Long, cT As Long
-    Dim i As Long, k As Long, n As Long
-    Dim parts As Variant
-    Dim rowRng As Range
+' Oldest version first: 1.2 after 1.1, 1.10 after 1.9. Lines with the same
+' version keep their order.
+Private Sub SortByVersion(ByVal entries As Collection)
+    Dim arr() As Variant
+    Dim i As Long, j As Long, n As Long
+    Dim t As Variant
 
-    On Error GoTo Failed
-    n = UBound(hist) - LBound(hist) + 1
-
-    cV = ColumnByName(lo, "Version")
-    cD = ColumnByName(lo, "Date")
-    cT = ColumnByName(lo, "Description")
-    If cT = 0 Then cT = ColumnByName(lo, "Changes")
-    If cV = 0 Then cV = 1
-    If cD = 0 Then cD = 2
-    If cT = 0 Then cT = 3
-    If lo.ListColumns.Count < 3 Then
-        FillHistoryTable = "The Revision History table on the README sheet has fewer than " & _
-                           "three columns, so it was left as it is. "
-        Exit Function
-    End If
-
-    If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.ClearContents
-    Do While lo.ListRows.Count < n
-        lo.ListRows.Add
-    Loop
-
-    For i = LBound(hist) To UBound(hist)
-        parts = Split(CStr(hist(i)), "|", 3)
-        If UBound(parts) = 2 Then
-            k = k + 1
-            Set rowRng = lo.ListRows(k).Range
-            With rowRng.Cells(1, cV)
-                .NumberFormat = "@"          ' so 1.10 stays 1.10
-                .Value = Trim$(parts(0))
-                .HorizontalAlignment = xlLeft
-            End With
-            With rowRng.Cells(1, cD)
-                .Value = DayMonthYear(Trim$(parts(1)))
-                .NumberFormat = "dd/mm/yyyy"
-                .HorizontalAlignment = xlLeft
-            End With
-            rowRng.Cells(1, cT).Value = Trim$(parts(2))
-        End If
+    n = entries.Count
+    If n < 2 Then Exit Sub
+    ReDim arr(1 To n)
+    For i = 1 To n
+        arr(i) = entries(i)
     Next i
-    Exit Function
+    For i = 2 To n
+        t = arr(i)
+        j = i - 1
+        Do While j >= 1
+            If VersionKey(CStr(arr(j)(0))) <= VersionKey(CStr(t(0))) Then Exit Do
+            arr(j + 1) = arr(j)
+            j = j - 1
+        Loop
+        arr(j + 1) = t
+    Next i
+    For i = n To 1 Step -1
+        entries.Remove i
+    Next i
+    For i = 1 To n
+        entries.Add arr(i)
+    Next i
+End Sub
 
-Failed:
-    FillHistoryTable = "The Revision History table on the README sheet could not be " & _
-                       "written: error " & Err.Number & " - " & Err.Description & ". "
+
+' "1.10" -> 1010000, so versions sort as numbers part by part. Each part
+' counts by its leading digits, so a hand-typed "1.1a" sits beside 1.1.
+Private Function VersionKey(ByVal v As String) As Double
+    Dim p As Variant
+    Dim i As Long
+    Dim mult As Double
+
+    p = Split(Trim$(v), ".")
+    mult = 1000000#
+    For i = LBound(p) To UBound(p)
+        If i - LBound(p) > 2 Then Exit For
+        VersionKey = VersionKey + Val(p(i)) * mult      ' "1a" counts as 1
+        mult = mult / 1000
+    Next i
+End Function
+
+
+' A date typed as text, "02/09/2026", made a real date read day first, so
+' writing it back cannot turn it into 9 February. Anything else unchanged.
+Private Function AsDateIfDayMonthYear(ByVal v As Variant) As Variant
+    AsDateIfDayMonthYear = v
+    If VarType(v) = vbString Then
+        If CStr(v) Like "#*/#*/####" Then AsDateIfDayMonthYear = DayMonthYear(CStr(v))
+    End If
 End Function
 
 
@@ -374,22 +488,54 @@ Private Function ColumnByName(ByVal lo As ListObject, ByVal colName As String) A
 End Function
 
 
-' Rewrites the README sheet when its Revision History does not start with
+' True when the Revision History already lists this version, anywhere in it.
+Private Function HistoryHasVersion(ByVal ws As Worksheet, ByVal head As Range, _
+                                   ByVal ver As String) As Boolean
+    Dim lo As ListObject
+    Dim cell As Range
+    Dim k As Long, cV As Long
+
+    Set lo = ws.Cells(head.Row + 1, head.Column).ListObject
+    If Not lo Is Nothing Then
+        If lo.DataBodyRange Is Nothing Then Exit Function
+        cV = ColumnByName(lo, "Version")
+        If cV = 0 Then cV = 1
+        For Each cell In lo.ListColumns(cV).DataBodyRange.Cells
+            If StrComp(AsText(CellValue(cell)), ver, vbTextCompare) = 0 Then
+                HistoryHasVersion = True
+                Exit Function
+            End If
+        Next cell
+        Exit Function
+    End If
+
+    k = head.Row + 2
+    Do While Len(AsText(CellValue(ws.Cells(k, head.Column)))) > 0 And k < head.Row + 500
+        If StrComp(AsText(CellValue(ws.Cells(k, head.Column))), ver, vbTextCompare) = 0 Then
+            HistoryHasVersion = True
+            Exit Function
+        End If
+        k = k + 1
+    Loop
+End Function
+
+
+' Brings the README sheet up to date when its Revision History does not list
 ' the version this code is: an update whose finishing step never ran, or a
 ' workbook that has never had the table. Quiet when it is already right, and
 ' never stops the workbook opening.
 Private Sub RefreshReadmeIfBehind()
     Dim ws As Worksheet
     Dim head As Range
-    Dim shown As String
 
     On Error GoTo Done
     Set ws = GetSheet(ThisWorkbook, SH_README)
     If Not ws Is Nothing Then
         Set head = FindHistoryHeading(ws)
-        If Not head Is Nothing Then shown = AsText(CellValue(head.Offset(2, 0)))
+        If Not head Is Nothing Then
+            If HistoryHasVersion(ws, head, TOOL_VERSION) Then Exit Sub
+        End If
     End If
-    If StrComp(shown, TOOL_VERSION, vbTextCompare) = 0 Then Exit Sub
 
     mReadmeProblem = WriteVersionHistory() & WriteReadmeInstructions()
     If Len(mReadmeProblem) > 0 Then
