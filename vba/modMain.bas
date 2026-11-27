@@ -56,6 +56,11 @@ Private Const LBL_HFIMG   As String = "Header image"
 Private Const LBL_HFSCALE As String = "Header image scale %"
 Private Const LBL_CLASS   As String = "Security classification"
 Private Const LBL_UPDATE  As String = "Update source"   ' modUpdate reads it by this label
+
+' The README sheet, and the heading of the version table on it. "Version
+' history" is recognised too, with or without a colon, in any case.
+Private Const SH_README     As String = "README"
+Private Const HISTORY_HEAD  As String = "Revision History:"
 Private Const LBL_SETUP   As String = "Last setup run"
 Private Const LBL_LIST    As String = "Last list refresh"
 
@@ -159,13 +164,16 @@ Private Sub InstallToolCore(ByVal quiet As Boolean)
         End If
     End If
 
+    WriteVersionHistory
+    WriteReadmeInstructions
+
     wsSetup.Activate
     On Error Resume Next
     ActiveWindow.DisplayGridlines = False
     On Error GoTo 0
 
     If quiet Then Exit Sub
-    MsgBox "Ready. Schedule tool version " & TOOL_VERSION & "." & vbCrLf & vbCrLf & _
+    MsgBox "Ready. The version history is on the README sheet." & vbCrLf & vbCrLf & _
            "1. Fill in Client, Project Name and Project Number on this sheet, and the " & _
            "Security classification." & vbCrLf & _
            "2. Save this file into the project folder with the schedules." & vbCrLf & _
@@ -173,6 +181,312 @@ Private Sub InstallToolCore(ByVal quiet As Boolean)
            "4. Press 'Set up / repair links' with nothing ticked, and say Yes to all.", _
            vbInformation, "Schedule tool"
 End Sub
+
+
+' ===========================================================================
+' The Revision History table on the README sheet
+'
+' Written from ToolHistory in modUtil on every install and update, so each
+' workbook shows the history of the code it is running and nobody keeps a
+' version table by hand.
+'
+' The tool owns only its own block: the cell reading "Revision History:" (or
+' "Version history", colon or not), the header row under it, and the rows
+' under that down to the first empty one, across the table's width. The
+' heading is kept as it is written. Nothing else on the sheet is touched.
+' With no such heading the block is added two rows under whatever is on the
+' sheet, and a README sheet is made if there is none.
+' ===========================================================================
+Private Sub WriteVersionHistory()
+    Dim ws As Worksheet
+    Dim head As Range
+    Dim r As Long, c As Long, w As Long, endRow As Long
+    Dim hist As Variant, parts As Variant
+    Dim i As Long, n As Long
+
+    On Error GoTo Failed
+    hist = ToolHistory()
+    n = UBound(hist) - LBound(hist) + 1
+    w = 3
+
+    Set ws = GetSheet(ThisWorkbook, SH_README)
+    If ws Is Nothing Then Set ws = EnsureSheet(SH_README)
+
+    Set head = FindHistoryHeading(ws)
+    If head Is Nothing Then
+        If Application.WorksheetFunction.CountA(ws.UsedRange) = 0 Then
+            r = 1
+        Else
+            r = ws.UsedRange.Row + ws.UsedRange.Rows.Count + 1
+        End If
+        c = 1
+        Set head = ws.Cells(r, c)
+        head.Value = HISTORY_HEAD
+    Else
+        r = head.Row
+        c = head.Column
+
+        ' The old table's width is its header row's, and at least three.
+        w = 0
+        Do While Len(AsText(CellValue(ws.Cells(r + 1, c + w)))) > 0 And w < 20
+            w = w + 1
+        Loop
+        If w < 3 Then w = 3
+
+        endRow = r
+        Do While Application.WorksheetFunction.CountA( _
+                     ws.Range(ws.Cells(endRow + 1, c), ws.Cells(endRow + 1, c + w - 1))) > 0
+            endRow = endRow + 1
+            If endRow > r + 500 Then Exit Do
+        Loop
+        If endRow > r Then
+            With ws.Range(ws.Cells(r + 1, c), ws.Cells(endRow, c + w - 1))
+                .UnMerge
+                .Clear
+            End With
+        End If
+
+        ' One more line each release. When the table needs more rows than it
+        ' had, only its own columns are pushed down, so whatever sits under it
+        ' moves with them and nothing beside it moves at all.
+        If r + 1 + n > endRow Then
+            ws.Range(ws.Cells(endRow + 1, c), ws.Cells(r + 1 + n, c + w - 1)).Insert _
+                Shift:=xlDown
+        End If
+    End If
+
+    head.Font.Bold = True
+
+    ws.Cells(r + 1, c).Value = "Version"
+    ws.Cells(r + 1, c + 1).Value = "Date"
+    ws.Cells(r + 1, c + 2).Value = "Description"
+    With ws.Range(ws.Cells(r + 1, c), ws.Cells(r + 1, c + 2))
+        .Font.Bold = True
+        .Interior.Color = RGB(230, 230, 230)
+        .Borders(xlEdgeBottom).LineStyle = xlContinuous
+    End With
+
+    For i = LBound(hist) To UBound(hist)
+        parts = Split(CStr(hist(i)), "|", 3)
+        If UBound(parts) = 2 Then
+            With ws.Cells(r + 2 + i - LBound(hist), c)
+                .NumberFormat = "@"          ' so 1.10 stays 1.10
+                .Value = Trim$(parts(0))
+                .HorizontalAlignment = xlLeft
+            End With
+            With ws.Cells(r + 2 + i - LBound(hist), c + 1)
+                .Value = DayMonthYear(Trim$(parts(1)))
+                .NumberFormat = "dd/mm/yyyy"
+                .HorizontalAlignment = xlLeft
+            End With
+            ws.Cells(r + 2 + i - LBound(hist), c + 2).Value = Trim$(parts(2))
+        End If
+    Next i
+    Exit Sub
+
+Failed:
+    ' A protected README sheet, say. The install carries on without it.
+End Sub
+
+
+Private Function FindHistoryHeading(ByVal ws As Worksheet) As Range
+    Dim cell As Range
+    Dim v As String
+
+    For Each cell In ws.UsedRange.Cells
+        v = UCase$(Trim$(AsText(CellValue(cell))))
+        If Right$(v, 1) = ":" Then v = Trim$(Left$(v, Len(v) - 1))
+        If v = "REVISION HISTORY" Or v = "VERSION HISTORY" Then
+            Set FindHistoryHeading = cell
+            Exit Function
+        End If
+    Next cell
+End Function
+
+
+' "27/11/2026" as a real date, read as day/month/year whatever Windows is set
+' to. Left as text if it is not one.
+Private Function DayMonthYear(ByVal s As String) As Variant
+    Dim p As Variant
+    DayMonthYear = s
+    p = Split(s, "/")
+    If UBound(p) <> 2 Then Exit Function
+    If Not (IsNumeric(p(0)) And IsNumeric(p(1)) And IsNumeric(p(2))) Then Exit Function
+    On Error Resume Next
+    DayMonthYear = DateSerial(CLng(p(2)), CLng(p(1)), CLng(p(0)))
+    On Error GoTo 0
+End Function
+
+
+' ===========================================================================
+' The instructions on the README sheet
+'
+' Written from ReadmeItems below on every install and update, so they always
+' describe the buttons this workbook actually has.
+'
+' The tool owns only the numbered list in column A: from the line starting
+' "[1]" down to the last line numbered after it. Anything above it, such as
+' who made the tool and how to reach them, and anything beside it, such as
+' the Revision History table, is left alone. With no list there yet it
+' starts two rows under whatever is in column A. When the list grows, only
+' column A is pushed down.
+' ===========================================================================
+Private Sub WriteReadmeInstructions()
+    Dim ws As Worksheet
+    Dim items As Collection
+    Dim first As Long, last As Long, lastA As Long
+    Dim r As Long, k As Long, i As Long
+    Dim oldCount As Long
+
+    On Error GoTo Failed
+    Set items = ReadmeItems()
+
+    Set ws = GetSheet(ThisWorkbook, SH_README)
+    If ws Is Nothing Then Set ws = EnsureSheet(SH_README)
+
+    lastA = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For r = 1 To lastA
+        If Left$(Trim$(AsText(CellValue(ws.Cells(r, 1)))), 3) = "[1]" Then
+            first = r
+            Exit For
+        End If
+    Next r
+
+    If first > 0 Then
+        last = first
+        k = 2
+        Do While Left$(Trim$(AsText(CellValue(ws.Cells(last + 1, 1)))), Len("[" & k & "]")) = _
+                 "[" & k & "]"
+            last = last + 1
+            k = k + 1
+        Loop
+    Else
+        If lastA = 1 And Len(AsText(CellValue(ws.Cells(1, 1)))) = 0 Then
+            first = 1
+        Else
+            first = lastA + 2
+        End If
+        last = first - 1
+    End If
+
+    oldCount = last - first + 1
+    If items.Count > oldCount Then
+        ws.Range(ws.Cells(last + 1, 1), ws.Cells(first + items.Count - 1, 1)).Insert Shift:=xlDown
+    ElseIf items.Count < oldCount Then
+        ws.Range(ws.Cells(first + items.Count, 1), ws.Cells(last, 1)).ClearContents
+    End If
+
+    For i = 1 To items.Count
+        With ws.Cells(first + i - 1, 1)
+            .Value = "[" & i & "] " & items(i)
+            .WrapText = True
+            .VerticalAlignment = xlTop
+        End With
+    Next i
+    ws.Range(ws.Rows(first), ws.Rows(first + items.Count - 1)).AutoFit
+    Exit Sub
+
+Failed:
+    ' A protected README sheet, say. The install carries on without it.
+End Sub
+
+
+' The README instructions, one entry per numbered point, without the number.
+' Change them here: every workbook gets the new text on its next update.
+Private Function ReadmeItems() As Collection
+    Dim c As New Collection
+    Dim L As String
+    L = vbLf
+
+    c.Add "What this is. One MAINPROJECTINFO.xlsm per project, kept in the same folder as " & _
+          "the schedules. The project details are typed once on the Setup sheet and every " & _
+          "schedule links to them. A schedule copied somewhere else still opens and reads " & _
+          "correctly; only its Client, Project Name and Project Number stop updating."
+
+    c.Add "Once per PC: File > Options > Trust Center > Trust Center Settings > Macro " & _
+          "Settings, tick 'Trust access to the VBA project object model'. This is only for " & _
+          "'Check for updates'; everything else works without it."
+
+    c.Add "Setting up a project. Put the schedules and this file on Filery, then export them " & _
+          "to a local folder and open this file from there: Excel cannot work through a " & _
+          "browser link. On Setup fill in Client, Project Name, Project Number and Security " & _
+          "classification. Press 'Refresh schedule list', then 'Set up / repair links' with " & _
+          "nothing ticked, and say Yes to all."
+
+    c.Add "Choosing which schedules. Every button works on the rows with an x in column A of " & _
+          "ScheduleList, and only those. With nothing ticked it offers to do ALL of them, " & _
+          "says so in capitals and defaults to No. Ticks stay until you delete them, so the " & _
+          "same set can go through several buttons in a row."
+
+    c.Add "The sheets." & L & _
+          "Setup: the project details, options and buttons. Yellow cells are yours to fill " & _
+          "in. A change here reaches a schedule the next time 'Set up / repair links' runs " & _
+          "on it, so changing the project number and running it on everything changes it " & _
+          "on every schedule." & L & _
+          "ScheduleList: what is actually saved in each schedule, one row each, with a " & _
+          "Checks column saying OK or what is wrong." & L & _
+          "Log: a line per file for the last 5 runs, newest at the top." & L & _
+          "README: this sheet. The tool rewrites these numbered points and the Revision " & _
+          "History table on every update; anything else on it is yours."
+
+    c.Add "Issuing a revision. Tick the schedules, then type in the blue 'New ...' columns at " & _
+          "the far right of ScheduleList. Anything left blank there is taken from the NEW " & _
+          "REVISION block on Setup, so values common to every schedule are typed once. Press " & _
+          "'Add or fix revision (ticked)'. The new line goes directly under the last " & _
+          "revision, and a revision already in a schedule is refused." & L & _
+          "Then press 'Export ticked to PDF' to issue the same set."
+
+    c.Add "Fixing a typo in the latest revision. Leave New Rev blank and type only what is " & _
+          "wrong, for example just New Date, then press 'Add or fix revision (ticked)'. It " & _
+          "corrects the latest revision line instead of adding one, changes nothing else, " & _
+          "and the Log shows the old value and the new. Clear any Revision in the NEW " & _
+          "REVISION block on Setup first, or it adds that revision instead."
+
+    c.Add "PDFs. 'Export ticked to PDF' writes one PDF per ticked schedule into a _pdf folder " & _
+          "beside them, replacing older copies, after one question. Answer No to it to pick " & _
+          "another folder or one PDF per sheet. With nothing ticked it asks for a folder or " & _
+          "the files instead. It never changes a schedule."
+
+    c.Add "Adding a schedule. Put the file in the folder and press 'Refresh schedule list'; " & _
+          "it shows as NOT A SCHEDULE YET. Tick it and press 'Set up new schedule(s)'. In one " & _
+          "go it gets the Front Cover and Revision Page from the Reference schedule on Setup " & _
+          "(keeping its own title and any revision history), its links, the title block, the " & _
+          "headers and footers, and its sheets put in order."
+
+    c.Add "Security marking (OFFICIAL, CONFIDENTIAL and so on). Choose it in 'Security " & _
+          "classification' on Setup, tick the schedules and press 'Set classification'. It " & _
+          "changes the marking where it already is, keeping its font, and adds it where it " & _
+          "is missing. The Classification column on ScheduleList shows what each file is " & _
+          "really marked, footers included, and Checks flags any that differ."
+
+    c.Add "One-job buttons, right-hand column on Setup, each on the ticked schedules:" & L & _
+          "Set up / repair links: points them at this file and rebuilds their links. Use it " & _
+          "for #REF on a cover or revision page, or after changing anything on Setup. Safe " & _
+          "to run again." & L & _
+          "Copy headers & footers / Copy cover & revision page: from the Reference schedule " & _
+          "on Setup. Set that one up by hand first." & L & _
+          "Title block: draws the title block and notes box to fit the schedule's columns, " & _
+          "so nothing is merged by hand." & L & _
+          "Tidy sheets: sheet order and names only, no cell is changed." & L & _
+          "Rename files: press once to see the proposed names in New FileName, again to rename."
+
+    c.Add "Checking. After any button, read the Checks column on ScheduleList: project " & _
+          "details that differ from Setup, a revision or date different from most of the " & _
+          "schedules, a missing revision description, security markings, links to other " & _
+          "files. Hide the Checks column while doing QA if it gets in the way. Click a file " & _
+          "name to open that schedule; the buttons leave a file you have open alone."
+
+    c.Add "Backups. With 'Backup before changes' set to Yes on Setup, every button that " & _
+          "changes schedules first copies them into a dated _backup folder beside them. " & _
+          "Leave it on: most of these changes cannot be undone any other way."
+
+    c.Add "Updates. 'Check for updates' gets the latest version of the tool from 'Update " & _
+          "source' on Setup, says what is new, and installs it when you say Yes. Only the " & _
+          "tool changes: the project details, settings, ticks and Log stay as they are. The " & _
+          "Revision History on this sheet shows what each version changed."
+
+    Set ReadmeItems = c
+End Function
 
 
 ' ===========================================================================
@@ -207,7 +521,8 @@ Public Sub AfterToolUpdate()
     On Error GoTo 0
 
     MsgBox "Updated to schedule tool version " & TOOL_VERSION & "." & vbCrLf & vbCrLf & _
-           "The Setup sheet and buttons have been rebuilt and the file saved." & _
+           "The Setup sheet, the buttons and the version history on the README sheet " & _
+           "have been rebuilt, and the file saved." & _
            IIf(Len(swapNote) > 0, vbCrLf & vbCrLf & "The updater itself could not be " & _
                "updated: " & swapNote & " It still works; import modUpdate by hand to " & _
                "get the new one.", "") & vbCrLf & vbCrLf & _
@@ -3216,8 +3531,8 @@ Private Sub BuildSetupSheet(ByVal ws As Worksheet)
     Note ws.Range("H28"), "'Title block' fits the block and notes to each schedule's columns. No merging by hand."
     Note ws.Range("H29"), "Cells shaded yellow are the ones you fill in. Progress shows in the status bar, bottom left."
     Note ws.Range("H30"), "Every run writes a line per file to the Log sheet, then a summary."
-    Note ws.Range("H31"), "Schedule tool version " & TOOL_VERSION & _
-                          ". 'Check for updates' installs a newer one from 'Update source'."
+    Note ws.Range("H31"), "'Check for updates' installs a newer version from 'Update source'. " & _
+                          "The version history is on the README sheet."
 
     ' --- Layout ------------------------------------------------------------
     ws.Columns("A").ColumnWidth = 24

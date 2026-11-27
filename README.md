@@ -49,11 +49,13 @@ says whether anything has changed, and on a Yes:
 project details, options, project fields and suitability codes on Setup, the
 ScheduleList with its ticks and typed values, and the Log. The list is emptied
 only when an update changes its columns, and the next refresh fills it again.
-The version shown under the buttons comes from `TOOL_VERSION` in `modUtil`, so
-changing it in the source is all it takes for everyone to see the new number.
+The **Revision History** table and the numbered instructions on the README
+sheet are rewritten from the new code, so it always matches what the workbook is running (see
+[Releasing a version](#releasing-a-version)). The update box lists the versions
+on offer that the workbook does not have yet.
 
 It decides whether anything changed from the code itself, not the version
-number, so an update that kept the same `TOOL_VERSION` is still found. It
+number, so an update that kept the same version is still found. It
 fetches all of them before touching anything, and checks each one really is
 that module, so a sign-in page or "not found" page is never installed as code.
 
@@ -99,23 +101,54 @@ runs is anyone's guess.
 Import **all of them** every time. They change together, and a mismatched set
 fails in confusing ways rather than obviously.
 
-The install box and the note under the buttons on the Setup sheet both show
-the tool version. If that number is not what you expect, the import did not
-take.
+The Revision History table on the README sheet shows the version installed. If
+its top line is not what you expect, the import did not take.
 
-### Changing the version number
+### Releasing a version
 
-One place, the declarations at the top of `vba/modUtil.bas`:
+The version history lives in one place, `ToolHistory` near the top of
+`vba/modUtil.bas`, newest first:
 
 ```vba
-Public Const TOOL_VERSION As String = "1.2"
+Public Function ToolHistory() As Variant
+    ToolHistory = Array( _
+        "1.3|04/12/2026|What changed, in a line", _
+        "1.2|27/11/2026|Overhaul of selection by X system and added updating function")
+End Function
 ```
 
-That single constant feeds both the "Ready. Schedule tool version ..." box and
-the note on the Setup sheet. Change it, re-import `modUtil`, run `InstallTool`.
+To release: add a line at the top (`version|dd/mm/yyyy|what changed`, no `|`
+in the text), set `TOOL_VERSION` just above it to the same number, add the
+same line to [Version history](#version-history) below, and merge to `main`.
 
-The **Version** table on your own README sheet is separate; the tool never
-touches that sheet, so keep it in step by hand.
+From that, with nothing typed by hand in any workbook:
+
+- **Check for updates** lists the new line(s) in its box before installing
+- `InstallTool` and every update write the whole list to the **Revision
+  History** table on the README sheet
+
+That table is the only place the workbook shows a version. The tool owns just
+that block: the cell reading `Revision History:` (`Version history` is
+recognised too, colon or not, and the heading is kept as written), the header
+row under it, and the rows down to the first empty one. When the table needs
+another row, only its own columns are pushed down. With no such heading it is
+added two rows under whatever is on the sheet, and a README sheet is made if
+there is none.
+
+### The README sheet instructions
+
+The numbered points in column A of the README sheet are written the same way,
+from `ReadmeItems` in `vba/modMain.bas`, on every install and update. So the
+instructions always describe the buttons the workbook actually has: change the
+text there, merge, and every workbook gets it on its next update.
+
+The tool owns only the numbered list: from the line starting `[1]` down to the
+last numbered line after it. Anything above it, such as who made the tool and
+how to reach them, and anything beside it is never touched. When the list
+grows, only column A is pushed down.
+
+`TOOL_VERSION` stays because older copies of the update button read it to
+say which version is on offer.
 
 ## Per project
 
@@ -296,7 +329,8 @@ new name.
 It does **not** touch the project values in `B1:B4`, the New revision values,
 the **PROJECT FIELDS** block (names or values: schedules link to those cells by
 address), column F (the suitability codes), or any other sheet in the workbook,
-so a README sheet of your own is safe. Versions before 1.2 cleared the project
+apart from the Revision History table and the numbered instructions on the
+README sheet. Versions before 1.2 cleared the project
 field **names** on every install; if yours went missing, type them back in.
 
 | Cell | Meaning |
@@ -931,3 +965,9 @@ is left alone.
 - Revision numbers above 999 would collide across families.
 - A PDF path longer than 255 characters is refused rather than truncated, which
   a deep synced folder plus `_pdf` can reach.
+
+## Version history
+
+| Version | Date | Changes |
+|---|---|---|
+| 1.2 | 27/11/2026 | Overhaul of selection by X system and added updating function |
