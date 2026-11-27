@@ -494,56 +494,88 @@ End Sub
 
 
 ' ===========================================================================
-' Add revision to ticked - append a revision line to every ticked schedule
+' Add or fix revision - on every ticked schedule
 '
-' Each row can carry its own new revision in the "New ..." columns. Anything
-' left blank there falls back to the block on the Setup sheet, so reissuing
-' all 24 on one revision and reissuing 6 of them on different ones are the
-' same operation.
+' A New Rev on the row (or in the NEW REVISION block on Setup) adds that
+' revision as a new line. No New Rev anywhere means fix the latest line
+' instead: whatever else is typed overwrites it, so a typo in the date or the
+' description is corrected without adding a revision for it.
+'
+' Each row can carry its own values in the "New ..." columns. Anything left
+' blank there falls back to the block on the Setup sheet, so reissuing all 24
+' on one revision and reissuing 6 of them on different ones are the same
+' operation.
 '
 ' The tick is kept afterwards, so "Export ticked to PDF" straight after
 ' issues exactly the schedules that were just revised. Pressing this twice
-' does no harm: a revision already in a table is refused.
+' does no harm: a revision already in a table is refused, and a fix that is
+' already in place changes nothing.
 ' ===========================================================================
 Public Sub AddRevisionToTicked()
     Dim wsSetup As Worksheet, wsList As Worksheet
     Dim r As Long, lastRow As Long, n As Long, k As Long, j As Long
     Dim folderPath As String, fileName As String
     Dim wbTgt As Workbook
-    Dim res As String
+    Dim res As String, what As String, why As String
     Dim fld(0 To 6) As Variant
+    Dim fixDate As Variant
+    Dim adds As Long, fixes As Long, blanks As Long
     Dim done As Long, failed As Long, skipped As Long
     Dim started As Double
+    Const JOB As String = "Add or fix revision"
 
     Set wsSetup = GetSheet(ThisWorkbook, SH_SETUP)
     Set wsList = GetSheet(ThisWorkbook, SH_LIST)
     If wsSetup Is Nothing Or wsList Is Nothing Then Exit Sub
 
+    ' Count each kind first, so the question says what is about to happen.
     lastRow = wsList.Cells(wsList.Rows.Count, C_FILE).End(xlUp).Row
     For r = 2 To lastRow
-        If IsTicked(wsList, r) Then n = n + 1
+        If IsTicked(wsList, r) Then
+            n = n + 1
+            For j = 0 To REV_FIELDS - 1
+                fld(j) = RowOrSetup(wsList, wsSetup, r, j)
+            Next j
+            If Len(AsText(fld(0))) > 0 Then
+                adds = adds + 1
+            ElseIf HasAnyField(fld) Then
+                fixes = fixes + 1
+            Else
+                blanks = blanks + 1
+            End If
+        End If
     Next r
 
     If n = 0 Then
         MsgBox "Nothing ticked." & vbCrLf & vbCrLf & _
-               "Put an x in column A of ScheduleList next to each schedule being reissued, " & _
-               "and type the new revision in the 'New ...' columns on that row." & vbCrLf & vbCrLf & _
+               "Put an x in column A of ScheduleList next to each schedule, and type in " & _
+               "the 'New ...' columns on that row:" & vbCrLf & vbCrLf & _
+               "  - with a New Rev, that revision is ADDED as a new line" & vbCrLf & _
+               "  - with no New Rev, what you type CORRECTS the latest line, for a typo " & _
+               "in its date or description" & vbCrLf & vbCrLf & _
                "Anything you leave blank is taken from the 'New revision' block on " & _
                "the Setup sheet, so you can fill in the common bits once.", _
-               vbExclamation, "Add revision"
+               vbExclamation, JOB
         Exit Sub
     End If
 
-    If MsgBox("Add a revision line to " & n & " schedule(s)?", _
-              vbQuestion + vbYesNo, "Add revision") = vbNo Then Exit Sub
+    If MsgBox(n & " schedule(s) ticked:" & vbCrLf & vbCrLf & _
+              IIf(adds > 0, "    " & adds & " get a NEW revision line (New Rev given)" & vbCrLf, "") & _
+              IIf(fixes > 0, "    " & fixes & " have their LATEST revision line corrected " & _
+                             "(no New Rev, other values given)" & vbCrLf, "") & _
+              IIf(blanks > 0, "    " & blanks & " have nothing typed and are skipped" & vbCrLf, "") & _
+              vbCrLf & "Blank 'New ...' cells are filled from the NEW REVISION block on the " & _
+              "Setup sheet, so clear anything there you do not mean to apply. Every change " & _
+              "is written to the Log sheet, old value and new." & vbCrLf & vbCrLf & "Continue?", _
+              vbQuestion + vbYesNo, JOB) = vbNo Then Exit Sub
 
     folderPath = SchedulesFolder()
     If Len(folderPath) = 0 Then Exit Sub
 
     On Error GoTo Fail
-    LogStart "Add revision"
+    LogStart JOB
     BeginQuiet xlCalculationAutomatic
-    ProgressStart n, "Adding revisions"
+    ProgressStart n, "Adding and fixing revisions"
     started = Timer
 
     For r = 2 To lastRow
@@ -556,23 +588,43 @@ Public Sub AddRevisionToTicked()
                 fld(j) = RowOrSetup(wsList, wsSetup, r, j)
             Next j
 
-            If Len(AsText(fld(0))) = 0 Or Not IsDate(fld(2)) Then
+            why = ""
+            If Len(AsText(fld(0))) > 0 Then
+                If Not IsDate(fld(2)) Then why = "Adding a revision needs a valid date, " & _
+                                                 "on the row or on Setup."
+            ElseIf Not HasAnyField(fld) Then
+                why = "Nothing typed: no New Rev to add, and nothing to correct."
+            ElseIf Len(AsText(fld(2))) > 0 And Not IsDate(fld(2)) Then
+                why = "New Date '" & AsText(fld(2)) & "' is not a date."
+            End If
+
+            If Len(why) > 0 Then
                 skipped = skipped + 1
-                LogLine fileName, "Skipped", _
-                    "Needs at least a revision and a valid date, on the row or on Setup."
+                LogLine fileName, "Skipped", why
             ElseIf Not OpenInExcel(fileName, skipped) Then
                 Set wbTgt = OpenQuiet(EndSep(folderPath) & fileName, False)
                 If wbTgt Is Nothing Then
                     failed = failed + 1
                     LogLine fileName, "FAILED", "Could not open the file."
                 Else
-                    res = AppendRevision(wbTgt, AsText(fld(0)), AsText(fld(1)), CDate(fld(2)), _
-                                         AsText(fld(3)), AsText(fld(4)), AsText(fld(5)), AsText(fld(6)))
+                    If Len(AsText(fld(0))) > 0 Then
+                        res = AppendRevision(wbTgt, AsText(fld(0)), AsText(fld(1)), CDate(fld(2)), _
+                                             AsText(fld(3)), AsText(fld(4)), AsText(fld(5)), AsText(fld(6)))
+                        what = "Added " & AsText(fld(0)) & " " & Format$(CDate(fld(2)), "dd/mm/yyyy")
+                    Else
+                        ' A date typed as text goes through CDate, which reads
+                        ' it the way Windows is set (dd/mm here), never as US.
+                        fixDate = Empty
+                        If IsDate(fld(2)) Then fixDate = CDate(fld(2))
+                        res = AmendLatestRevision(wbTgt, AsText(fld(1)), fixDate, _
+                                                  AsText(fld(3)), AsText(fld(4)), _
+                                                  AsText(fld(5)), AsText(fld(6)), what)
+                    End If
+
                     If Len(res) = 0 Then
                         wbTgt.Close SaveChanges:=True
                         done = done + 1
-                        LogLine fileName, "OK", "Added " & AsText(fld(0)) & " " & _
-                                Format$(CDate(fld(2)), "dd/mm/yyyy")
+                        LogLine fileName, "OK", what
                         ClearRowEntry wsList, r
                     Else
                         wbTgt.Close SaveChanges:=False
@@ -587,15 +639,28 @@ Public Sub AddRevisionToTicked()
 
     ProgressDone
     EndQuiet
-    ShowSummary "Add revision", done, skipped, failed, Timer - started, _
+    ShowSummary JOB, done, skipped, failed, Timer - started, _
                 IIf(done > 0, "The ticks are kept, so 'Export ticked to PDF' now issues " & _
                               "these same schedules.", "")
     RefreshScheduleList
     Exit Sub
 
 Fail:
-    Recover "Add revision", wbTgt
+    Recover JOB, wbTgt
 End Sub
+
+
+' True when any of Status..Description has something in it. Revision is
+' field 0 and not counted: no revision is what makes this a fix.
+Private Function HasAnyField(ByRef fld() As Variant) As Boolean
+    Dim j As Long
+    For j = 1 To REV_FIELDS - 1
+        If Len(AsText(fld(j))) > 0 Then
+            HasAnyField = True
+            Exit Function
+        End If
+    Next j
+End Function
 
 
 ' ===========================================================================
@@ -3141,9 +3206,9 @@ Private Sub BuildSetupSheet(ByVal ws As Worksheet)
 
     Note ws.Range("H16"), "WHICH SCHEDULES: every button works on the rows with an x in column A of ScheduleList."
     Note ws.Range("H17"), "Nothing ticked means all of them, and the button says ALL and defaults to No first."
-    Note ws.Range("H18"), "Ticks stay until you delete them, so 'Add revision' then 'Export ticked to PDF' issues the same set."
+    Note ws.Range("H18"), "Ticks stay until you delete them, so 'Add or fix revision' then 'Export ticked to PDF' issues the same set."
     Note ws.Range("H20"), "To reissue: tick the rows, fill the blue 'New ...' columns (blanks come from NEW REVISION on the left),"
-    Note ws.Range("H21"), "press 'Add revision to ticked', then 'Export ticked to PDF'."
+    Note ws.Range("H21"), "press 'Add or fix revision', then 'Export ticked to PDF'. No New Rev = correct the latest line instead."
     Note ws.Range("H23"), "Security marking: choose it in 'Security classification', tick, press 'Set classification'."
     Note ws.Range("H24"), "The Classification column on ScheduleList shows what each file is really marked, footers included."
     Note ws.Range("H26"), "'Copy headers & footers' and 'Copy cover & revision page' copy from the Reference schedule."
@@ -3327,7 +3392,7 @@ Private Sub BuildListHeaders(ByVal ws As Worksheet)
         "Every button on the Setup sheet that changes a schedule, and the PDF " & _
         "export, works on the ticked rows only. With nothing ticked it offers to " & _
         "do ALL of them, and says so first." & vbCrLf & vbCrLf & _
-        "Ticks stay until you delete them, so 'Add revision to ticked' then " & _
+        "Ticks stay until you delete them, so 'Add or fix revision' then " & _
         "'Export ticked to PDF' issues the same set."
     HeaderNote ws.Cells(1, C_REVDESC), _
         "The Description on the revision table row of the revision shown in " & _
@@ -3346,7 +3411,10 @@ Private Sub BuildListHeaders(ByVal ws As Worksheet)
         "type a name here yourself." & vbCrLf & vbCrLf & _
         "Leave the extension off and the current one is kept."
     HeaderNote ws.Cells(1, C_NEW_FIRST), _
-        "The revision line to add to this schedule." & vbCrLf & vbCrLf & _
+        "With a New Rev: the revision line to ADD to this schedule." & vbCrLf & vbCrLf & _
+        "Left blank: whatever you type in the other 'New ...' columns CORRECTS the " & _
+        "latest revision line instead, e.g. just a New Date to fix a typo in it. " & _
+        "Only what you type is changed." & vbCrLf & vbCrLf & _
         "Fill in as much or as little as you like: blank cells fall back to the " & _
         "'New revision' block on the Setup sheet. Rows without an x in column A " & _
         "are ignored." & vbCrLf & vbCrLf & _
@@ -3456,7 +3524,7 @@ Private Sub BuildButtons(ByVal ws As Worksheet)
     ' left to right they are how often you need them: every issue, when a
     ' schedule joins the project, and one-off fixes.
     ButtonAt ws, "H", 2, "RefreshScheduleList", "Refresh schedule list"
-    ButtonAt ws, "H", 4, "AddRevisionToTicked", "Add revision to ticked"
+    ButtonAt ws, "H", 4, "AddRevisionToTicked", "Add or fix revision (ticked)"
     ButtonAt ws, "H", 6, "ExportToPdf", "Export ticked to PDF"
     ButtonAt ws, "H", 11, "CheckForUpdates", "Check for updates"
 
