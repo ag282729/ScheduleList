@@ -203,6 +203,7 @@ End Sub
 Private Function WriteVersionHistory() As String
     Dim ws As Worksheet
     Dim head As Range
+    Dim lo As ListObject
     Dim r As Long, c As Long, w As Long, endRow As Long
     Dim hist As Variant, parts As Variant
     Dim i As Long, n As Long
@@ -228,6 +229,17 @@ Private Function WriteVersionHistory() As String
     Else
         r = head.Row
         c = head.Column
+
+        ' Drawn as an Excel table (Insert > Table)? Then it is filled the way a
+        ' table wants: its rows emptied and refilled, its headers and style
+        ' kept. Unmerging or inserting cells inside a table is refused by
+        ' Excel, which is what used to stop this part with nothing written.
+        Set lo = ws.Cells(r + 1, c).ListObject
+        If Not lo Is Nothing Then
+            WriteVersionHistory = FillHistoryTable(lo, hist)
+            head.Font.Bold = True
+            Exit Function
+        End If
 
         ' The old table's width is its header row's, and at least three.
         w = 0
@@ -291,6 +303,74 @@ Failed:
     ' A protected README sheet, say. The install carries on, and says so.
     WriteVersionHistory = "The Revision History table on the README sheet could not be " & _
                           "written: error " & Err.Number & " - " & Err.Description & ". "
+End Function
+
+
+' The history written into an Excel table: every row emptied, then filled
+' newest first by column name (Version, Date, Description or Changes; the
+' first three columns when the names are something else). Rows are added
+' only when the table is too short; spare empty rows are left as they are.
+Private Function FillHistoryTable(ByVal lo As ListObject, ByVal hist As Variant) As String
+    Dim cV As Long, cD As Long, cT As Long
+    Dim i As Long, k As Long, n As Long
+    Dim parts As Variant
+    Dim rowRng As Range
+
+    On Error GoTo Failed
+    n = UBound(hist) - LBound(hist) + 1
+
+    cV = ColumnByName(lo, "Version")
+    cD = ColumnByName(lo, "Date")
+    cT = ColumnByName(lo, "Description")
+    If cT = 0 Then cT = ColumnByName(lo, "Changes")
+    If cV = 0 Then cV = 1
+    If cD = 0 Then cD = 2
+    If cT = 0 Then cT = 3
+    If lo.ListColumns.Count < 3 Then
+        FillHistoryTable = "The Revision History table on the README sheet has fewer than " & _
+                           "three columns, so it was left as it is. "
+        Exit Function
+    End If
+
+    If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.ClearContents
+    Do While lo.ListRows.Count < n
+        lo.ListRows.Add
+    Loop
+
+    For i = LBound(hist) To UBound(hist)
+        parts = Split(CStr(hist(i)), "|", 3)
+        If UBound(parts) = 2 Then
+            k = k + 1
+            Set rowRng = lo.ListRows(k).Range
+            With rowRng.Cells(1, cV)
+                .NumberFormat = "@"          ' so 1.10 stays 1.10
+                .Value = Trim$(parts(0))
+                .HorizontalAlignment = xlLeft
+            End With
+            With rowRng.Cells(1, cD)
+                .Value = DayMonthYear(Trim$(parts(1)))
+                .NumberFormat = "dd/mm/yyyy"
+                .HorizontalAlignment = xlLeft
+            End With
+            rowRng.Cells(1, cT).Value = Trim$(parts(2))
+        End If
+    Next i
+    Exit Function
+
+Failed:
+    FillHistoryTable = "The Revision History table on the README sheet could not be " & _
+                       "written: error " & Err.Number & " - " & Err.Description & ". "
+End Function
+
+
+Private Function ColumnByName(ByVal lo As ListObject, ByVal colName As String) As Long
+    Dim i As Long
+    For i = 1 To lo.ListColumns.Count
+        If StrComp(Trim$(lo.ListColumns(i).Name), colName, vbTextCompare) = 0 Then
+            ColumnByName = i
+            Exit Function
+        End If
+    Next i
 End Function
 
 
