@@ -1196,6 +1196,144 @@ Public Function AppendRevision(ByVal wb As Workbook, ByVal rev As String, ByVal 
 End Function
 
 
+' Corrects the latest revision line in place, for a typo in its date or
+' description, rather than adding another. Only the fields given (not blank)
+' are written, and the Revision itself is never changed here.
+'
+' "Latest" is the one the title block shows, ranked the same way: by family
+' (REV_PREFIXES, so C01 beats P05) and then by number, the later row winning
+' a tie. So the fix always lands on the revision that is printed.
+'
+' Returns "" and puts what changed in `what` ("Changed P02: Date 25/11/2026
+' -> 26/11/2026; "), or says why nothing was.
+Public Function AmendLatestRevision(ByVal wb As Workbook, ByVal status As String, _
+                                    ByVal issueDate As Variant, ByVal prep As String, _
+                                    ByVal chk As String, ByVal app As String, _
+                                    ByVal descr As String, ByRef what As String) As String
+    Dim wsRev As Worksheet
+    Dim lo As ListObject
+    Dim target As Range
+    Dim revText As String
+
+    what = ""
+    Set wsRev = GetSheet(wb, SH_REV)
+    If wsRev Is Nothing Then
+        AmendLatestRevision = "no Revision Page"
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set lo = wsRev.ListObjects("RevisionTable")
+    On Error GoTo 0
+    If lo Is Nothing Then
+        AmendLatestRevision = "no RevisionTable"
+        Exit Function
+    End If
+
+    Set target = LatestRevisionRow(lo, revText)
+    If target Is Nothing Then
+        AmendLatestRevision = "the revision table is empty, so there is no revision to " & _
+                              "correct. Type a New Rev to add one."
+        Exit Function
+    End If
+
+    AmendCol lo, target, "Status", status, what
+    If Not IsEmpty(issueDate) Then AmendCol lo, target, "Date", issueDate, what
+    AmendCol lo, target, "Prepared by", prep, what
+    AmendCol lo, target, "Checked by", chk, what
+    AmendCol lo, target, "Approved by", app, what
+    AmendCol lo, target, "Description", descr, what
+
+    If Len(what) = 0 Then
+        AmendLatestRevision = revText & " already says that, so nothing was changed."
+    Else
+        what = "Changed " & revText & ": " & what
+    End If
+End Function
+
+
+' The latest revision line, ranked as the title block ranks it.
+Private Function LatestRevisionRow(ByVal lo As ListObject, ByRef revText As String) As Range
+    Dim body As Range
+    Dim cRev As Long, r As Long
+    Dim best As Double, rk As Double
+    Dim t As String
+
+    Set body = lo.DataBodyRange
+    If body Is Nothing Then Exit Function
+    cRev = ColumnIndexByName(lo, "Revision")
+    If cRev = 0 Then Exit Function
+
+    best = -1
+    For r = 1 To body.Rows.Count
+        t = AsText(CellValue(body.Cells(r, cRev)))
+        If Len(t) > 0 Then
+            rk = RevRank(t)
+            If rk >= best Then
+                best = rk
+                Set LatestRevisionRow = body.Rows(r)
+                revText = t
+            End If
+        End If
+    Next r
+End Function
+
+
+' The same number the revision formulas give a revision: its family's place
+' in REV_PREFIXES times 1000, plus the number after the prefix.
+Private Function RevRank(ByVal revText As String) As Double
+    Dim names As Variant, order As Variant
+    Dim i As Long, idx As Long, pri As Long
+    Dim t As String, p As String, rest As String
+
+    t = UCase$(Trim$(revText))
+    rest = t
+    names = Split(REV_PREFIXES, ",")
+    order = ByLengthDesc(names)
+    For i = LBound(order) To UBound(order)
+        idx = order(i)
+        p = UCase$(Trim$(names(idx)))
+        If Left$(t, Len(p)) = p Then
+            pri = idx + 1
+            rest = Mid$(t, Len(p) + 1)
+            Exit For
+        End If
+    Next i
+
+    If IsNumeric(rest) Then RevRank = pri * 1000# + CDbl(rest) Else RevRank = pri * 1000#
+End Function
+
+
+' One field of the latest line, written only when given and different. A
+' cell holding a formula is left alone and said so.
+Private Sub AmendCol(ByVal lo As ListObject, ByVal rowRange As Range, ByVal colName As String, _
+                     ByVal v As Variant, ByRef what As String)
+    Dim idx As Long
+    Dim cell As Range
+    Dim was As String, given As String
+
+    given = AsText(v)
+    If Len(given) = 0 Then Exit Sub
+
+    idx = ColumnIndexByName(lo, colName)
+    If idx = 0 Then
+        what = what & colName & " not changed (no such column); "
+        Exit Sub
+    End If
+
+    Set cell = rowRange.Cells(1, idx)
+    was = AsText(CellValue(cell))
+    If StrComp(was, given, vbBinaryCompare) = 0 Then Exit Sub
+    If cell.HasFormula Then
+        what = what & colName & " not changed (it is a formula); "
+        Exit Sub
+    End If
+
+    cell.Value = v
+    what = what & colName & " " & IIf(Len(was) = 0, "(blank)", was) & " -> " & given & "; "
+End Sub
+
+
 ' The row a new revision belongs in: the first empty row of the table, so the
 ' line lands directly under the previous revision.
 '

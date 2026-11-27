@@ -140,10 +140,10 @@ Most of what these buttons do cannot be undone except from the backup, so
 doing the one schedule that needs it, rather than all 26, is the safer habit,
 and the tool makes it the easy one.
 
-Ticks stay until you delete them. That is deliberate: **Add revision to
-ticked** then **Export ticked to PDF** issues exactly the schedules you just
-revised. Pressing Add revision twice does no harm, a revision already in a
-table is refused.
+Ticks stay until you delete them. That is deliberate: **Add or fix
+revision** then **Export ticked to PDF** issues exactly the schedules you just
+revised. Pressing it twice does no harm: a revision already in a table is
+refused, and a correction already made changes nothing.
 
 A ticked row whose file has gone from the folder is left out and named in the
 confirmation box. The reference schedule is never a target of the buttons
@@ -156,7 +156,7 @@ Three groups on the Setup sheet, left to right by how often you need them.
 | Every issue | Adding a schedule | One job at a time |
 |---|---|---|
 | Refresh schedule list | Set up new schedule(s) | Set up / repair links |
-| Add revision to ticked | | Set classification |
+| Add or fix revision (ticked) | | Set classification |
 | Export ticked to PDF | | Copy headers & footers |
 | | | Copy cover & revision page |
 | | | Title block |
@@ -234,19 +234,32 @@ Files are read without updating links and without recalculating, so the list
 shows what is actually saved in each file, i.e. exactly what a recipient sees
 when they open it offline.
 
-**Add revision to ticked** — put an `x` in column A and fill in the
+**Add or fix revision (ticked)**: put an `x` in column A and fill in the
 `New Rev` / `New Status` / `New Date` / ... columns on that row. Anything left
 blank falls back to the *New revision* block on the Setup sheet.
 
-So both jobs are the same operation:
+What it does depends on **New Rev**:
 
-- **All 24 on one revision** — fill in the Setup block once, tick every row.
-- **6 of 24, on different revisions** — type each one on its own row, tick
+- **New Rev given** (on the row or on Setup): that revision is **added** as a
+  new line.
+- **No New Rev anywhere**: whatever else is typed **corrects the latest line**
+  instead. Typo in the date of P02? Leave New Rev blank, put the right date in
+  New Date, press it. Only the fields you typed change; the revision itself
+  never does. "Latest" is the revision the title block shows, ranked the same
+  way, so the fix lands on what is printed.
+
+The confirmation says how many will be added and how many corrected, and the
+Log sheet records every correction with the old value and the new.
+
+So adding is the same operation at any scale:
+
+- **All 24 on one revision**: fill in the Setup block once, tick every row.
+- **6 of 24, on different revisions**: type each one on its own row, tick
   those six, leave the rest alone.
 
-It appends one row per revision table, refuses a revision number that is
-already in that file, and clears the typed values on the rows that succeeded.
-The tick stays, so **Export ticked to PDF** straight after issues the same set.
+It refuses a revision number that is already in that file, and clears the
+typed values on the rows that succeeded. The tick stays, so **Export ticked
+to PDF** straight after issues the same set.
 
 The new line goes in **directly under the last revision**, not at the bottom of
 the table. Revision tables are usually drawn with spare rows below the last
