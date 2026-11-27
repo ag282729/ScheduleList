@@ -117,6 +117,9 @@ Private Const LOG_RUNS As Long = 5
 
 Private mLogRow As Long
 
+' What went wrong writing the README sheet during the last install, or "".
+Private mReadmeProblem As String
+
 
 ' ===========================================================================
 ' One-time install
@@ -164,8 +167,7 @@ Private Sub InstallToolCore(ByVal quiet As Boolean)
         End If
     End If
 
-    WriteVersionHistory
-    WriteReadmeInstructions
+    mReadmeProblem = WriteVersionHistory() & WriteReadmeInstructions()
 
     wsSetup.Activate
     On Error Resume Next
@@ -174,6 +176,7 @@ Private Sub InstallToolCore(ByVal quiet As Boolean)
 
     If quiet Then Exit Sub
     MsgBox "Ready. The version history is on the README sheet." & vbCrLf & vbCrLf & _
+           IIf(Len(mReadmeProblem) > 0, mReadmeProblem & vbCrLf & vbCrLf, "") & _
            "1. Fill in Client, Project Name and Project Number on this sheet, and the " & _
            "Security classification." & vbCrLf & _
            "2. Save this file into the project folder with the schedules." & vbCrLf & _
@@ -197,9 +200,10 @@ End Sub
 ' With no such heading the block is added two rows under whatever is on the
 ' sheet, and a README sheet is made if there is none.
 ' ===========================================================================
-Private Sub WriteVersionHistory()
+Private Function WriteVersionHistory() As String
     Dim ws As Worksheet
     Dim head As Range
+    Dim lo As ListObject
     Dim r As Long, c As Long, w As Long, endRow As Long
     Dim hist As Variant, parts As Variant
     Dim i As Long, n As Long
@@ -225,6 +229,17 @@ Private Sub WriteVersionHistory()
     Else
         r = head.Row
         c = head.Column
+
+        ' Drawn as an Excel table (Insert > Table)? Then it is filled the way a
+        ' table wants: its rows emptied and refilled, its headers and style
+        ' kept. Unmerging or inserting cells inside a table is refused by
+        ' Excel, which is what used to stop this part with nothing written.
+        Set lo = ws.Cells(r + 1, c).ListObject
+        If Not lo Is Nothing Then
+            WriteVersionHistory = FillHistoryTable(lo, hist)
+            head.Font.Bold = True
+            Exit Function
+        End If
 
         ' The old table's width is its header row's, and at least three.
         w = 0
@@ -282,10 +297,105 @@ Private Sub WriteVersionHistory()
             ws.Cells(r + 2 + i - LBound(hist), c + 2).Value = Trim$(parts(2))
         End If
     Next i
-    Exit Sub
+    Exit Function
 
 Failed:
-    ' A protected README sheet, say. The install carries on without it.
+    ' A protected README sheet, say. The install carries on, and says so.
+    WriteVersionHistory = "The Revision History table on the README sheet could not be " & _
+                          "written: error " & Err.Number & " - " & Err.Description & ". "
+End Function
+
+
+' The history written into an Excel table: every row emptied, then filled
+' newest first by column name (Version, Date, Description or Changes; the
+' first three columns when the names are something else). Rows are added
+' only when the table is too short; spare empty rows are left as they are.
+Private Function FillHistoryTable(ByVal lo As ListObject, ByVal hist As Variant) As String
+    Dim cV As Long, cD As Long, cT As Long
+    Dim i As Long, k As Long, n As Long
+    Dim parts As Variant
+    Dim rowRng As Range
+
+    On Error GoTo Failed
+    n = UBound(hist) - LBound(hist) + 1
+
+    cV = ColumnByName(lo, "Version")
+    cD = ColumnByName(lo, "Date")
+    cT = ColumnByName(lo, "Description")
+    If cT = 0 Then cT = ColumnByName(lo, "Changes")
+    If cV = 0 Then cV = 1
+    If cD = 0 Then cD = 2
+    If cT = 0 Then cT = 3
+    If lo.ListColumns.Count < 3 Then
+        FillHistoryTable = "The Revision History table on the README sheet has fewer than " & _
+                           "three columns, so it was left as it is. "
+        Exit Function
+    End If
+
+    If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.ClearContents
+    Do While lo.ListRows.Count < n
+        lo.ListRows.Add
+    Loop
+
+    For i = LBound(hist) To UBound(hist)
+        parts = Split(CStr(hist(i)), "|", 3)
+        If UBound(parts) = 2 Then
+            k = k + 1
+            Set rowRng = lo.ListRows(k).Range
+            With rowRng.Cells(1, cV)
+                .NumberFormat = "@"          ' so 1.10 stays 1.10
+                .Value = Trim$(parts(0))
+                .HorizontalAlignment = xlLeft
+            End With
+            With rowRng.Cells(1, cD)
+                .Value = DayMonthYear(Trim$(parts(1)))
+                .NumberFormat = "dd/mm/yyyy"
+                .HorizontalAlignment = xlLeft
+            End With
+            rowRng.Cells(1, cT).Value = Trim$(parts(2))
+        End If
+    Next i
+    Exit Function
+
+Failed:
+    FillHistoryTable = "The Revision History table on the README sheet could not be " & _
+                       "written: error " & Err.Number & " - " & Err.Description & ". "
+End Function
+
+
+Private Function ColumnByName(ByVal lo As ListObject, ByVal colName As String) As Long
+    Dim i As Long
+    For i = 1 To lo.ListColumns.Count
+        If StrComp(Trim$(lo.ListColumns(i).Name), colName, vbTextCompare) = 0 Then
+            ColumnByName = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+' Rewrites the README sheet when its Revision History does not start with
+' the version this code is: an update whose finishing step never ran, or a
+' workbook that has never had the table. Quiet when it is already right, and
+' never stops the workbook opening.
+Private Sub RefreshReadmeIfBehind()
+    Dim ws As Worksheet
+    Dim head As Range
+    Dim shown As String
+
+    On Error GoTo Done
+    Set ws = GetSheet(ThisWorkbook, SH_README)
+    If Not ws Is Nothing Then
+        Set head = FindHistoryHeading(ws)
+        If Not head Is Nothing Then shown = AsText(CellValue(head.Offset(2, 0)))
+    End If
+    If StrComp(shown, TOOL_VERSION, vbTextCompare) = 0 Then Exit Sub
+
+    mReadmeProblem = WriteVersionHistory() & WriteReadmeInstructions()
+    If Len(mReadmeProblem) > 0 Then
+        MsgBox mReadmeProblem, vbExclamation, "README sheet"
+    End If
+Done:
 End Sub
 
 
@@ -331,7 +441,7 @@ End Function
 ' starts two rows under whatever is in column A. When the list grows, only
 ' column A is pushed down.
 ' ===========================================================================
-Private Sub WriteReadmeInstructions()
+Private Function WriteReadmeInstructions() As String
     Dim ws As Worksheet
     Dim items As Collection
     Dim first As Long, last As Long, lastA As Long
@@ -384,11 +494,12 @@ Private Sub WriteReadmeInstructions()
         End With
     Next i
     ws.Range(ws.Rows(first), ws.Rows(first + items.Count - 1)).AutoFit
-    Exit Sub
+    Exit Function
 
 Failed:
-    ' A protected README sheet, say. The install carries on without it.
-End Sub
+    WriteReadmeInstructions = "The instructions on the README sheet could not be " & _
+                              "written: error " & Err.Number & " - " & Err.Description & ". "
+End Function
 
 
 ' The README instructions, one entry per numbered point, without the number.
@@ -523,6 +634,7 @@ Public Sub AfterToolUpdate()
     MsgBox "Updated to schedule tool version " & TOOL_VERSION & "." & vbCrLf & vbCrLf & _
            "The Setup sheet, the buttons and the version history on the README sheet " & _
            "have been rebuilt, and the file saved." & _
+           IIf(Len(mReadmeProblem) > 0, vbCrLf & vbCrLf & mReadmeProblem, "") & _
            IIf(Len(swapNote) > 0, vbCrLf & vbCrLf & "The updater itself could not be " & _
                "updated: " & swapNote & " It still works; import modUpdate by hand to " & _
                "get the new one.", "") & vbCrLf & vbCrLf & _
@@ -2655,6 +2767,11 @@ Public Sub Auto_Open()
     Dim wsSetup As Worksheet
     Set wsSetup = GetSheet(ThisWorkbook, SH_SETUP)
     If wsSetup Is Nothing Then Exit Sub
+
+    ' The README sheet is meant to follow the code. If the last update did
+    ' not get as far as rewriting it, this catches up the next time the file
+    ' is opened.
+    RefreshReadmeIfBehind
     If UCase$(Trim$(CStr(Opt(wsSetup, LBL_AUTO, R_OPT_AUTO).Value))) = "YES" Then
         ' Never nag on startup - if the folder is not known, just skip.
         If Len(SchedulesFolder(False)) > 0 Then RefreshScheduleList
