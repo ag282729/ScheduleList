@@ -27,7 +27,9 @@ Option Explicit
 ' checksums, are the whole contract between the two modules.
 '
 ' Whether anything changed is decided by the code itself, not the version
-' number, so an update with the same TOOL_VERSION is still found.
+' number, so an update with the same version is still found. The update box
+' lists the versions on offer that this workbook does not have yet, from the
+' ToolHistory in the modUtil being offered.
 ' ---------------------------------------------------------------------------
 
 Private Const TOOL_MODULES As String = "modUtil,modSchedule,modMain"
@@ -46,7 +48,7 @@ Public Sub CheckForUpdates()
     Dim i As Long, n As Long, k As Long
     Dim changed As String
     Dim selfCode As String, selfChanged As Boolean
-    Dim localVer As String, remoteVer As String
+    Dim localVer As String, remoteVer As String, news As String
     Dim backupPath As String, tempPath As String
     Const JOB As String = "Check for updates"
 
@@ -92,6 +94,7 @@ Public Sub CheckForUpdates()
 
     localVer = VersionIn(ModuleText("modUtil"))
     remoteVer = VersionIn(code(IndexOf(names, "modUtil")))
+    news = WhatsNew(ModuleText("modUtil"), code(IndexOf(names, "modUtil")))
 
     If Len(changed) = 0 And Not selfChanged Then
         MsgBox "Up to date." & vbCrLf & vbCrLf & "Version " & localVer & ", the same as " & _
@@ -103,6 +106,7 @@ Public Sub CheckForUpdates()
               "    Installed:   " & localVer & vbCrLf & _
               "    Available:   " & remoteVer & _
               IIf(localVer = remoteVer, "  (same number, different code)", "") & vbCrLf & vbCrLf & _
+              IIf(Len(news) > 0, "What's new:" & vbCrLf & news & vbCrLf, "") & _
               "From " & base & vbCrLf & vbCrLf & _
               "Install it into this workbook?" & vbCrLf & vbCrLf & _
               "A copy of this workbook is saved first. Afterwards the Setup sheet and " & _
@@ -337,8 +341,18 @@ Private Function ModuleText(ByVal moduleName As String) As String
 End Function
 
 
+' The version a copy of modUtil says it is: the first entry of its
+' ToolHistory, or for older copies without one, its TOOL_VERSION.
 Private Function VersionIn(ByVal code As String) As String
+    Dim h As Variant
     Dim p As Long, q As Long
+
+    h = HistoryIn(code)
+    If IsArray(h) Then
+        VersionIn = h(0, 0)
+        Exit Function
+    End If
+
     p = InStr(1, code, "TOOL_VERSION As String = """, vbTextCompare)
     If p = 0 Then
         VersionIn = "(unknown)"
@@ -347,6 +361,67 @@ Private Function VersionIn(ByVal code As String) As String
     p = p + Len("TOOL_VERSION As String = """)
     q = InStr(p, code, """")
     If q > p Then VersionIn = Mid$(code, p, q - p) Else VersionIn = "(unknown)"
+End Function
+
+
+' The ToolHistory entries in a copy of modUtil, read from its text, as an
+' array of (version, date, changes), newest first. Empty when it has none.
+' Read as text, never by calling it: the copy on offer is not installed yet.
+Private Function HistoryIn(ByVal code As String) As Variant
+    Dim a As Long, b As Long
+    Dim body As String
+    Dim re As Object, ms As Object
+    Dim out() As String
+    Dim i As Long
+
+    a = InStr(1, code, "Function ToolHistory", vbTextCompare)
+    If a = 0 Then Exit Function
+    b = InStr(a, code, "End Function", vbTextCompare)
+    If b = 0 Then Exit Function
+    body = Mid$(code, a, b - a)
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.Pattern = """([^""|]*)\|([^""|]*)\|((?:[^""]|"""")*)"""
+    Set ms = re.Execute(body)
+    If ms.Count = 0 Then Exit Function
+
+    ReDim out(0 To ms.Count - 1, 0 To 2)
+    For i = 0 To ms.Count - 1
+        out(i, 0) = Trim$(ms(i).SubMatches(0))
+        out(i, 1) = Trim$(ms(i).SubMatches(1))
+        out(i, 2) = Replace(Trim$(ms(i).SubMatches(2)), """""", """")
+    Next i
+    HistoryIn = out
+End Function
+
+
+' The entries on offer that the installed copy does not have, one per line,
+' for the update box. "" when there are none to list.
+Private Function WhatsNew(ByVal installedCode As String, ByVal offeredCode As String) As String
+    Dim mine As Variant, theirs As Variant
+    Dim i As Long, j As Long
+    Dim have As Boolean
+
+    theirs = HistoryIn(offeredCode)
+    If Not IsArray(theirs) Then Exit Function
+    mine = HistoryIn(installedCode)
+
+    For i = 0 To UBound(theirs, 1)
+        have = False
+        If IsArray(mine) Then
+            For j = 0 To UBound(mine, 1)
+                If StrComp(mine(j, 0), theirs(i, 0), vbTextCompare) = 0 Then
+                    have = True
+                    Exit For
+                End If
+            Next j
+        End If
+        If Not have Then
+            WhatsNew = WhatsNew & "    " & theirs(i, 0) & "   " & theirs(i, 1) & "   " & _
+                       theirs(i, 2) & vbCrLf
+        End If
+    Next i
 End Function
 
 

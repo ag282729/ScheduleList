@@ -13,8 +13,9 @@ Public Const SH_SETUP As String = "Setup"
 Public Const SH_LIST  As String = "ScheduleList"
 Public Const SH_LOG   As String = "Log"
 
-' Shown on the Setup sheet and in the install box, so "which build is loaded"
-' is answerable at a glance after a re-import.
+' The version this code is. Always the version of the first ToolHistory
+' entry below. Older copies of the update button read this exact line to say
+' which version is on offer, so it stays even though ToolHistory says it too.
 Public Const TOOL_VERSION As String = "1.2"
 
 ' How far down/across we look for the "SCHEDULE OF ..." title cell.
@@ -32,6 +33,21 @@ Private mFso As Object
 Private mProgTotal As Long
 Private mProgStart As Double
 Private mProgCaption As String
+
+
+' ---------------------------------------------------------------------------
+' The version history, newest first, one "version|dd/mm/yyyy|what changed"
+' per entry. This is where a release is recorded: add a line at the top and
+' set TOOL_VERSION to match.
+'
+' InstallTool and every update write it to the VERSION HISTORY table on the
+' README sheet, and Check for updates lists the entries a workbook is missing,
+' so nobody keeps a version table by hand. A | cannot appear in the text.
+' ---------------------------------------------------------------------------
+Public Function ToolHistory() As Variant
+    ToolHistory = Array( _
+        "1.2|27/11/2026|Overhaul of selection by X system and added updating function")
+End Function
 
 
 ' Case-insensitive worksheet lookup. Returns Nothing if absent.

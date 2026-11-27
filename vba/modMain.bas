@@ -56,6 +56,10 @@ Private Const LBL_HFIMG   As String = "Header image"
 Private Const LBL_HFSCALE As String = "Header image scale %"
 Private Const LBL_CLASS   As String = "Security classification"
 Private Const LBL_UPDATE  As String = "Update source"   ' modUpdate reads it by this label
+
+' The sheet the VERSION HISTORY table goes on, and the heading that marks it.
+Private Const SH_README     As String = "README"
+Private Const HISTORY_HEAD  As String = "VERSION HISTORY"
 Private Const LBL_SETUP   As String = "Last setup run"
 Private Const LBL_LIST    As String = "Last list refresh"
 
@@ -159,13 +163,15 @@ Private Sub InstallToolCore(ByVal quiet As Boolean)
         End If
     End If
 
+    WriteVersionHistory
+
     wsSetup.Activate
     On Error Resume Next
     ActiveWindow.DisplayGridlines = False
     On Error GoTo 0
 
     If quiet Then Exit Sub
-    MsgBox "Ready. Schedule tool version " & TOOL_VERSION & "." & vbCrLf & vbCrLf & _
+    MsgBox "Ready. The version history is on the README sheet." & vbCrLf & vbCrLf & _
            "1. Fill in Client, Project Name and Project Number on this sheet, and the " & _
            "Security classification." & vbCrLf & _
            "2. Save this file into the project folder with the schedules." & vbCrLf & _
@@ -173,6 +179,140 @@ Private Sub InstallToolCore(ByVal quiet As Boolean)
            "4. Press 'Set up / repair links' with nothing ticked, and say Yes to all.", _
            vbInformation, "Schedule tool"
 End Sub
+
+
+' ===========================================================================
+' The VERSION HISTORY table on the README sheet
+'
+' Written from ToolHistory in modUtil on every install and update, so each
+' workbook shows the history of the code it is running and nobody keeps a
+' version table by hand.
+'
+' The tool owns only its own block: a cell reading VERSION HISTORY (or
+' REVISION HISTORY, which becomes VERSION HISTORY), the header row under it,
+' and the rows under that down to the first empty one, across the table's
+' width. Nothing else on the sheet is touched. With no such heading the block
+' is added two rows under whatever is on the sheet, and a README sheet is
+' made if there is none.
+' ===========================================================================
+Private Sub WriteVersionHistory()
+    Dim ws As Worksheet
+    Dim head As Range
+    Dim r As Long, c As Long, w As Long, endRow As Long
+    Dim hist As Variant, parts As Variant
+    Dim i As Long, n As Long
+
+    On Error GoTo Failed
+    hist = ToolHistory()
+    n = UBound(hist) - LBound(hist) + 1
+    w = 3
+
+    Set ws = GetSheet(ThisWorkbook, SH_README)
+    If ws Is Nothing Then Set ws = EnsureSheet(SH_README)
+
+    Set head = FindHistoryHeading(ws)
+    If head Is Nothing Then
+        If Application.WorksheetFunction.CountA(ws.UsedRange) = 0 Then
+            r = 1
+        Else
+            r = ws.UsedRange.Row + ws.UsedRange.Rows.Count + 1
+        End If
+        c = 1
+        Set head = ws.Cells(r, c)
+    Else
+        r = head.Row
+        c = head.Column
+
+        ' The old table's width is its header row's, and at least three.
+        w = 0
+        Do While Len(AsText(CellValue(ws.Cells(r + 1, c + w)))) > 0 And w < 20
+            w = w + 1
+        Loop
+        If w < 3 Then w = 3
+
+        endRow = r
+        Do While Application.WorksheetFunction.CountA( _
+                     ws.Range(ws.Cells(endRow + 1, c), ws.Cells(endRow + 1, c + w - 1))) > 0
+            endRow = endRow + 1
+            If endRow > r + 500 Then Exit Do
+        Loop
+        If endRow > r Then
+            With ws.Range(ws.Cells(r + 1, c), ws.Cells(endRow, c + w - 1))
+                .UnMerge
+                .Clear
+            End With
+        End If
+
+        ' One more line each release. When the table needs more rows than it
+        ' had, only its own columns are pushed down, so whatever sits under it
+        ' moves with them and nothing beside it moves at all.
+        If r + 1 + n > endRow Then
+            ws.Range(ws.Cells(endRow + 1, c), ws.Cells(r + 1 + n, c + w - 1)).Insert _
+                Shift:=xlDown
+        End If
+    End If
+
+    head.Value = HISTORY_HEAD
+    head.Font.Bold = True
+
+    ws.Cells(r + 1, c).Value = "Version"
+    ws.Cells(r + 1, c + 1).Value = "Date"
+    ws.Cells(r + 1, c + 2).Value = "Changes"
+    With ws.Range(ws.Cells(r + 1, c), ws.Cells(r + 1, c + 2))
+        .Font.Bold = True
+        .Interior.Color = RGB(230, 230, 230)
+        .Borders(xlEdgeBottom).LineStyle = xlContinuous
+    End With
+
+    For i = LBound(hist) To UBound(hist)
+        parts = Split(CStr(hist(i)), "|", 3)
+        If UBound(parts) = 2 Then
+            With ws.Cells(r + 2 + i - LBound(hist), c)
+                .NumberFormat = "@"          ' so 1.10 stays 1.10
+                .Value = Trim$(parts(0))
+                .HorizontalAlignment = xlLeft
+            End With
+            With ws.Cells(r + 2 + i - LBound(hist), c + 1)
+                .Value = DayMonthYear(Trim$(parts(1)))
+                .NumberFormat = "dd/mm/yyyy"
+                .HorizontalAlignment = xlLeft
+            End With
+            ws.Cells(r + 2 + i - LBound(hist), c + 2).Value = Trim$(parts(2))
+        End If
+    Next i
+    Exit Sub
+
+Failed:
+    ' A protected README sheet, say. The install carries on without it.
+End Sub
+
+
+Private Function FindHistoryHeading(ByVal ws As Worksheet) As Range
+    Dim cell As Range
+    Dim v As String
+
+    For Each cell In ws.UsedRange.Cells
+        v = UCase$(Trim$(AsText(CellValue(cell))))
+        If v = HISTORY_HEAD Or v = "REVISION HISTORY" Then
+            Set FindHistoryHeading = cell
+            Exit Function
+        End If
+    Next cell
+End Function
+
+
+' "27/11/2026" as a real date, read as day/month/year whatever Windows is set
+' to. Left as text if it is not one.
+Private Function DayMonthYear(ByVal s As String) As Variant
+    Dim p As Variant
+    DayMonthYear = s
+    p = Split(s, "/")
+    If UBound(p) <> 2 Then Exit Function
+    If Not (IsNumeric(p(0)) And IsNumeric(p(1)) And IsNumeric(p(2))) Then Exit Function
+    On Error Resume Next
+    DayMonthYear = DateSerial(CLng(p(2)), CLng(p(1)), CLng(p(0)))
+    On Error GoTo 0
+End Function
 
 
 ' ===========================================================================
@@ -207,7 +347,8 @@ Public Sub AfterToolUpdate()
     On Error GoTo 0
 
     MsgBox "Updated to schedule tool version " & TOOL_VERSION & "." & vbCrLf & vbCrLf & _
-           "The Setup sheet and buttons have been rebuilt and the file saved." & _
+           "The Setup sheet, the buttons and the version history on the README sheet " & _
+           "have been rebuilt, and the file saved." & _
            IIf(Len(swapNote) > 0, vbCrLf & vbCrLf & "The updater itself could not be " & _
                "updated: " & swapNote & " It still works; import modUpdate by hand to " & _
                "get the new one.", "") & vbCrLf & vbCrLf & _
@@ -3216,8 +3357,8 @@ Private Sub BuildSetupSheet(ByVal ws As Worksheet)
     Note ws.Range("H28"), "'Title block' fits the block and notes to each schedule's columns. No merging by hand."
     Note ws.Range("H29"), "Cells shaded yellow are the ones you fill in. Progress shows in the status bar, bottom left."
     Note ws.Range("H30"), "Every run writes a line per file to the Log sheet, then a summary."
-    Note ws.Range("H31"), "Schedule tool version " & TOOL_VERSION & _
-                          ". 'Check for updates' installs a newer one from 'Update source'."
+    Note ws.Range("H31"), "'Check for updates' installs a newer version from 'Update source'. " & _
+                          "The version history is on the README sheet."
 
     ' --- Layout ------------------------------------------------------------
     ws.Columns("A").ColumnWidth = 24
