@@ -49,8 +49,8 @@ says whether anything has changed, and on a Yes:
 project details, options, project fields and suitability codes on Setup, the
 ScheduleList with its ticks and typed values, and the Log. The list is emptied
 only when an update changes its columns, and the next refresh fills it again.
-The **VERSION HISTORY** table on the README sheet is rewritten from the new
-code, so it always matches what the workbook is running (see
+The **Revision History** table and the numbered instructions on the README
+sheet are rewritten from the new code, so it always matches what the workbook is running (see
 [Releasing a version](#releasing-a-version)). The update box lists the versions
 on offer that the workbook does not have yet.
 
@@ -101,7 +101,7 @@ runs is anyone's guess.
 Import **all of them** every time. They change together, and a mismatched set
 fails in confusing ways rather than obviously.
 
-The VERSION HISTORY table on the README sheet shows the version installed. If
+The Revision History table on the README sheet shows the version installed. If
 its top line is not what you expect, the import did not take.
 
 ### Releasing a version
@@ -124,16 +124,28 @@ same line to [Version history](#version-history) below, and merge to `main`.
 From that, with nothing typed by hand in any workbook:
 
 - **Check for updates** lists the new line(s) in its box before installing
-- `InstallTool` and every update write the whole list to the **VERSION
-  HISTORY** table on the README sheet
+- `InstallTool` and every update write the whole list to the **Revision
+  History** table on the README sheet
 
 That table is the only place the workbook shows a version. The tool owns just
-that block: a cell reading `VERSION HISTORY` (a `REVISION HISTORY` heading is
-taken over and renamed), the header row under it, and the rows down to the
-first empty one. The rest of the README sheet is never touched; when the table
-needs another row, only its own columns are pushed down. With no such heading
-it is added two rows under whatever is on the sheet, and a README sheet is
-made if there is none.
+that block: the cell reading `Revision History:` (`Version history` is
+recognised too, colon or not, and the heading is kept as written), the header
+row under it, and the rows down to the first empty one. When the table needs
+another row, only its own columns are pushed down. With no such heading it is
+added two rows under whatever is on the sheet, and a README sheet is made if
+there is none.
+
+### The README sheet instructions
+
+The numbered points in column A of the README sheet are written the same way,
+from `ReadmeItems` in `vba/modMain.bas`, on every install and update. So the
+instructions always describe the buttons the workbook actually has: change the
+text there, merge, and every workbook gets it on its next update.
+
+The tool owns only the numbered list: from the line starting `[1]` down to the
+last numbered line after it. Anything above it, such as who made the tool and
+how to reach them, and anything beside it is never touched. When the list
+grows, only column A is pushed down.
 
 `TOOL_VERSION` stays because older copies of the update button read it to
 say which version is on offer.
@@ -317,7 +329,8 @@ new name.
 It does **not** touch the project values in `B1:B4`, the New revision values,
 the **PROJECT FIELDS** block (names or values: schedules link to those cells by
 address), column F (the suitability codes), or any other sheet in the workbook,
-apart from the VERSION HISTORY table on the README sheet. Versions before 1.2 cleared the project
+apart from the Revision History table and the numbered instructions on the
+README sheet. Versions before 1.2 cleared the project
 field **names** on every install; if yours went missing, type them back in.
 
 | Cell | Meaning |
