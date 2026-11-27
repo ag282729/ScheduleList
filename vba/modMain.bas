@@ -261,7 +261,7 @@ Private Function WriteVersionHistory() As String
     For k = r + 2 To endRow
         If Len(AsText(CellValue(ws.Cells(k, c)))) > 0 Then
             entries.Add Array(AsText(CellValue(ws.Cells(k, c))), _
-                              AsDateIfDayMonthYear(CellValue(ws.Cells(k, c + 1))), _
+                              CellValue(ws.Cells(k, c + 1)), _
                               AsText(CellValue(ws.Cells(k, c + 2))))
         End If
     Next k
@@ -321,7 +321,7 @@ Private Function FillHistoryTable(ByVal lo As ListObject) As String
         Set rowRng = lo.ListRows(k).Range
         If Len(AsText(CellValue(rowRng.Cells(1, cV)))) > 0 Then
             entries.Add Array(AsText(CellValue(rowRng.Cells(1, cV))), _
-                              AsDateIfDayMonthYear(CellValue(rowRng.Cells(1, cD))), _
+                              CellValue(rowRng.Cells(1, cD)), _
                               AsText(CellValue(rowRng.Cells(1, cT))))
         End If
     Next k
@@ -381,40 +381,64 @@ Private Sub PutHistoryLine(ByVal vCell As Range, ByVal dCell As Range, ByVal tCe
         .Value = e(0)
         .HorizontalAlignment = xlLeft
     End With
+    ' Dates go in as text, day first, the way the template's table keeps
+    ' them. The cell is made Text BEFORE the value goes in: a real date put
+    ' into a Text cell is turned into text month first, which is how 1.2
+    ' came out as 11/27/2026.
     With dCell
-        .Value = e(1)
-        If VarType(e(1)) = vbDate Then .NumberFormat = "dd/mm/yyyy"
+        .NumberFormat = "@"
+        If VarType(e(1)) = vbDate Then
+            .Value = UkDate(e(1))
+        Else
+            .Value = AsText(e(1))
+        End If
         .HorizontalAlignment = xlLeft
     End With
     tCell.Value = e(2)
 End Sub
 
 
-' Adds each ToolHistory version not already among `entries`, as
-' Array(version, date, description). True when anything was added.
+' Brings `entries` in line with ToolHistory, as Array(version, date,
+' description): a version it does not have is added, and a version it has
+' takes its date and description from ToolHistory, which is where the tool's
+' own lines are corrected. Lines for versions ToolHistory does not know, such
+' as ones typed by hand, are left exactly as they are. True when anything
+' changed, so a table already right is not touched.
 Private Function AddMissingVersions(ByVal entries As Collection) As Boolean
     Dim hist As Variant, parts As Variant
-    Dim i As Long
-    Dim e As Variant
-    Dim have As Boolean
+    Dim i As Long, k As Long, found As Long
+    Dim ver As String, dt As String, txt As String
 
     hist = ToolHistory()
     For i = LBound(hist) To UBound(hist)
         parts = Split(CStr(hist(i)), "|", 3)
         If UBound(parts) = 2 Then
-            have = False
-            For Each e In entries
-                If StrComp(CStr(e(0)), Trim$(parts(0)), vbTextCompare) = 0 Then
-                    have = True
+            ver = Trim$(parts(0))
+            dt = Trim$(parts(1))
+            txt = Trim$(parts(2))
+            found = 0
+            For k = 1 To entries.Count
+                If StrComp(CStr(entries(k)(0)), ver, vbTextCompare) = 0 Then
+                    found = k
                     Exit For
                 End If
-            Next e
-            If Not have Then
-                entries.Add Array(Trim$(parts(0)), DayMonthYear(Trim$(parts(1))), Trim$(parts(2)))
+            Next k
+            If found = 0 Then
+                entries.Add Array(ver, dt, txt)
+                AddMissingVersions = True
+            ElseIf DateText(entries(found)(1)) <> dt Or CStr(entries(found)(2)) <> txt Then
+                entries.Add Array(ver, dt, txt), After:=found
+                entries.Remove found
                 AddMissingVersions = True
             End If
         End If
     Next i
+End Function
+
+
+' A history date as the table shows it, for comparing.
+Private Function DateText(ByVal v As Variant) As String
+    If VarType(v) = vbDate Then DateText = UkDate(v) Else DateText = AsText(v)
 End Function
 
 
@@ -464,16 +488,6 @@ Private Function VersionKey(ByVal v As String) As Double
         VersionKey = VersionKey + Val(p(i)) * mult      ' "1a" counts as 1
         mult = mult / 1000
     Next i
-End Function
-
-
-' A date typed as text, "02/09/2026", made a real date read day first, so
-' writing it back cannot turn it into 9 February. Anything else unchanged.
-Private Function AsDateIfDayMonthYear(ByVal v As Variant) As Variant
-    AsDateIfDayMonthYear = v
-    If VarType(v) = vbString Then
-        If CStr(v) Like "#*/#*/####" Then AsDateIfDayMonthYear = DayMonthYear(CStr(v))
-    End If
 End Function
 
 
@@ -560,18 +574,21 @@ Private Function FindHistoryHeading(ByVal ws As Worksheet) As Range
 End Function
 
 
-' "27/11/2026" as a real date, read as day/month/year whatever Windows is set
-' to. Left as text if it is not one.
-Private Function DayMonthYear(ByVal s As String) As Variant
-    Dim p As Variant
-    DayMonthYear = s
-    p = Split(s, "/")
-    If UBound(p) <> 2 Then Exit Function
-    If Not (IsNumeric(p(0)) And IsNumeric(p(1)) And IsNumeric(p(2))) Then Exit Function
-    On Error Resume Next
-    DayMonthYear = DateSerial(CLng(p(2)), CLng(p(1)), CLng(p(0)))
-    On Error GoTo 0
+' "27/11/2026" from a date, built from its parts so neither Windows' regional
+' settings nor Excel's US habits can turn it round.
+Private Function UkDate(ByVal d As Date) As String
+    UkDate = Format$(Day(d), "00") & "/" & Format$(Month(d), "00") & "/" & Year(d)
 End Function
+
+
+' The time now into a Setup cell, as a real date shown day first. The format
+' goes on before the value: text such as "02/12/2026 10:00" put into a cell
+' is read by Excel month first, so on the 1st to the 12th of a month it
+' would have become a different date.
+Private Sub StampNow(ByVal cell As Range)
+    cell.NumberFormat = "dd/mm/yyyy hh:mm"
+    cell.Value = Now
+End Sub
 
 
 ' ===========================================================================
@@ -932,7 +949,7 @@ Public Sub SetupProject()
     Next i
 
     ProgressDone
-    Opt(wsSetup, LBL_SETUP, R_OPT_SETUP).Value = Format$(Now, "dd/mm/yyyy hh:nn")
+    StampNow Opt(wsSetup, LBL_SETUP, R_OPT_SETUP)
     EndQuiet
 
     ShowSummary "Set up / repair links", done, skipped, failed, _
@@ -1051,7 +1068,7 @@ Public Sub RefreshScheduleList()
     FormatList wsList, r - 1
 
     ProgressDone
-    Opt(wsSetup, LBL_LIST, R_OPT_LIST).Value = Format$(Now, "dd/mm/yyyy hh:nn")
+    StampNow Opt(wsSetup, LBL_LIST, R_OPT_LIST)
     EndQuiet
 
     ShowSummary "Refresh schedule list", readCount, reused, failed, Timer - started, _
