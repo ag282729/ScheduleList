@@ -40,7 +40,7 @@ Private mProgCaption As String
 ' per entry. This is where a release is recorded: add a line at the top and
 ' set TOOL_VERSION to match.
 '
-' InstallTool and every update write it to the VERSION HISTORY table on the
+' InstallTool and every update write it to the Revision History table on the
 ' README sheet, and Check for updates lists the entries a workbook is missing,
 ' so nobody keeps a version table by hand. A | cannot appear in the text.
 ' ---------------------------------------------------------------------------
